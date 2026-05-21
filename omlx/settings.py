@@ -220,6 +220,16 @@ class SchedulerSettings:
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
+    # Cap on the number of sequences fused into a single decode step
+    # (mlx-lm BatchGenerator.completion_batch_size). When None, this
+    # follows max_concurrent_requests for back-compat. Setting it below
+    # max_concurrent_requests decouples HTTP-layer admission from
+    # GPU-layer batch fusion: requests can still queue at the HTTP layer
+    # while each Metal command buffer encodes at most N sequences. This
+    # is the lever for staying under Apple's GPU watchdog on small GPUs
+    # under multi-model load — see notes in /Volumes/WorkSSD/repos/
+    # personal/llamactl/docs/upstream-patches/.
+    max_completion_batch_size: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -236,9 +246,11 @@ class SchedulerSettings:
             value = data.get("completion_batch_size")
         if value is None:
             value = 8
+        mcb = data.get("max_completion_batch_size")
         return cls(
             max_concurrent_requests=value,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            max_completion_batch_size=(int(mcb) if mcb is not None else None),
         )
 
 
@@ -944,6 +956,11 @@ class GlobalSettings:
             and args.max_concurrent_requests is not None
         ):
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
+        if (
+            hasattr(args, "max_completion_batch_size")
+            and args.max_completion_batch_size is not None
+        ):
+            self.scheduler.max_completion_batch_size = args.max_completion_batch_size
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -1215,9 +1232,14 @@ class GlobalSettings:
         # the writer thread internally — the dir is not used for disk I/O.
         ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
 
+        completion_batch_size = (
+            self.scheduler.max_completion_batch_size
+            if self.scheduler.max_completion_batch_size is not None
+            else self.scheduler.max_concurrent_requests
+        )
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
-            completion_batch_size=self.scheduler.max_concurrent_requests,
+            completion_batch_size=completion_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
