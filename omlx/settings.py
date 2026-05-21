@@ -230,6 +230,14 @@ class SchedulerSettings:
     # under multi-model load — see notes in /Volumes/WorkSSD/repos/
     # personal/llamactl/docs/upstream-patches/.
     max_completion_batch_size: int | None = None
+    # Per-model overrides for `max_concurrent_requests`. Keyed by either
+    # the model id (basename of the model dir, e.g. "Qwen3-8B-MLX-4bit")
+    # or the fully-qualified model_name. When set, the Scheduler for that
+    # model uses the override value as its admission cap; models without
+    # an entry fall back to the global `max_concurrent_requests`. Lets
+    # operators run heterogeneous concurrency budgets across co-resident
+    # models on a shared GPU (e.g. mcr=4 on a 3B + mcr=1 on an 8B).
+    per_model_max_concurrent: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -247,10 +255,16 @@ class SchedulerSettings:
         if value is None:
             value = 8
         mcb = data.get("max_completion_batch_size")
+        per_model = data.get("per_model_max_concurrent") or {}
+        # Coerce to dict[str, int] regardless of JSON source typing.
+        per_model_typed: dict[str, int] = {
+            str(k): int(v) for k, v in per_model.items()
+        }
         return cls(
             max_concurrent_requests=value,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             max_completion_batch_size=(int(mcb) if mcb is not None else None),
+            per_model_max_concurrent=per_model_typed,
         )
 
 
@@ -961,6 +975,35 @@ class GlobalSettings:
             and args.max_completion_batch_size is not None
         ):
             self.scheduler.max_completion_batch_size = args.max_completion_batch_size
+        if (
+            hasattr(args, "per_model_max_concurrent")
+            and args.per_model_max_concurrent is not None
+        ):
+            # Accept either a pre-parsed dict (from JSON config) or the raw
+            # CLI string of the form "model_a=4,model_b=8".
+            raw = args.per_model_max_concurrent
+            parsed: dict[str, int] = {}
+            if isinstance(raw, dict):
+                parsed = {str(k): int(v) for k, v in raw.items()}
+            else:
+                for pair in str(raw).split(","):
+                    if not pair.strip():
+                        continue
+                    if "=" not in pair:
+                        raise ValueError(
+                            f"--per-model-max-concurrent: malformed pair "
+                            f"{pair!r}; expected key=value"
+                        )
+                    key, value = pair.split("=", 1)
+                    key = key.strip()
+                    try:
+                        parsed[key] = int(value.strip())
+                    except ValueError as e:
+                        raise ValueError(
+                            f"--per-model-max-concurrent: value for "
+                            f"{key!r} is not an integer: {value!r}"
+                        ) from e
+            self.scheduler.per_model_max_concurrent = parsed
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -1246,6 +1289,7 @@ class GlobalSettings:
             hot_cache_only=self.cache.hot_cache_only,
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            per_model_max_concurrent=dict(self.scheduler.per_model_max_concurrent),
         )
 
     def to_dict(self) -> dict[str, Any]:
