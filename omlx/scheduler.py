@@ -4688,12 +4688,50 @@ class Scheduler:
                 self.request_id_to_uid[request.request_id] = temp_uid
                 self.uid_to_request_id[temp_uid] = request.request_id
 
-                prefilled_cache, last_token = self._do_external_prefill(
-                    request,
-                    tokens_to_process,
-                    cache_to_use,
-                    vlm_embeds=vlm_embeds,
-                )
+                try:
+                    prefilled_cache, last_token = self._do_external_prefill(
+                        request,
+                        tokens_to_process,
+                        cache_to_use,
+                        vlm_embeds=vlm_embeds,
+                    )
+                except RuntimeError as e:
+                    # mlx-explore/mlx#2670: Metal command-buffer failures
+                    # (notably Insufficient Memory under cold-start pressure
+                    # when multiple iso procs load models simultaneously)
+                    # surface here from mx.eval() inside _do_external_prefill.
+                    # Without recovery the entire step() raises, the engine
+                    # loop logs an unhandled error, and every pending /v1/*
+                    # request on this proc gets a 500. Symmetric to the
+                    # decode-path catch below: isolate the failure to the
+                    # current request, finish it with a clear error, and let
+                    # the next step admit different waiters.
+                    if not str(e).startswith("[METAL]"):
+                        raise
+                    self.uid_to_request_id.pop(temp_uid, None)
+                    self.request_id_to_uid.pop(request.request_id, None)
+                    get_prefill_tracker().remove(request.request_id)
+                    self.requests.pop(request.request_id, None)
+                    self._metal_errors_recovered = (
+                        getattr(self, "_metal_errors_recovered", 0) + 1
+                    )
+                    logger.warning(
+                        "Metal command buffer failure during prefill of %s; "
+                        "isolating request and continuing batch "
+                        "(total recoveries: %d). Underlying error: %s",
+                        request.request_id,
+                        self._metal_errors_recovered,
+                        e,
+                    )
+                    rejected_outputs.append(
+                        RequestOutput(
+                            request_id=request.request_id,
+                            finished=True,
+                            finish_reason="error",
+                            error=f"metal_command_buffer_failed_prefill: {e}",
+                        )
+                    )
+                    continue
 
                 # Clean up temp UID mapping
                 del self.uid_to_request_id[temp_uid]
@@ -5459,7 +5497,66 @@ class Scheduler:
             # objects (prefill is handled externally before insert).
             if (self.batch_generator is not None or self._vlm_mtp_active) and self.running:
                 if self.batch_generator is not None:
-                    responses = list(self.batch_generator.next_generated())
+                    try:
+                        responses = list(self.batch_generator.next_generated())
+                    except RuntimeError as e:
+                        # mlx-explore/mlx#2670: when the exception-safety patch
+                        # is in effect, MLX surfaces Metal command-buffer
+                        # failures as `[METAL] Command buffer execution failed`
+                        # at the next eval/finalize/synchronize waitpoint
+                        # (which is inside next_generated()). Without recovery
+                        # the whole step fails and ALL running requests are
+                        # silently dropped — the failing request AND every
+                        # innocent batch-mate. Adapt to the v3 contract by
+                        # isolating the failure to a single victim request,
+                        # finishing it with a clear error, and continuing
+                        # the next step with the remaining sequences.
+                        if not str(e).startswith("[METAL]"):
+                            raise
+                        # Heuristic: without per-uid attribution from mlx-lm
+                        # we mark the most-recently-admitted running request
+                        # as the victim. The alternative (failing the whole
+                        # batch) loses more work; the trade-off is that an
+                        # innocent late-arrival can occasionally absorb a
+                        # blame that belonged to an older sibling. Document
+                        # this in the PR description.
+                        victim_id = next(reversed(self.running), None)
+                        if victim_id is None:
+                            raise
+                        self._metal_errors_recovered = (
+                            getattr(self, "_metal_errors_recovered", 0) + 1
+                        )
+                        logger.warning(
+                            "Metal command buffer failure during generation; "
+                            "isolating request %s with finish_reason=error "
+                            "and continuing batch (total recoveries: %d). "
+                            "Underlying error: %s",
+                            victim_id,
+                            self._metal_errors_recovered,
+                            e,
+                        )
+                        responses = []
+                        metal_error_failures = [
+                            RequestOutput(
+                                request_id=victim_id,
+                                finished=True,
+                                finish_reason="error",
+                                error=f"metal_command_buffer_failed: {e}",
+                            )
+                        ]
+                        output.outputs.extend(metal_error_failures)
+                        output.finished_request_ids.add(victim_id)
+                        try:
+                            self._cleanup_finished([victim_id])
+                        except RuntimeError as cleanup_exc:
+                            if not str(cleanup_exc).startswith("[METAL]"):
+                                raise
+                            logger.warning(
+                                "Metal cascade during cleanup of victim %s; "
+                                "deferring to next step (error: %s)",
+                                victim_id,
+                                cleanup_exc,
+                            )
                 else:
                     responses = []
                 # Drive vlm_mtp generators alongside BatchGenerator. Order
