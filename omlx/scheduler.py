@@ -566,6 +566,18 @@ class SchedulerConfig:
     # operators run e.g. mcr=4 on a 3B model alongside mcr=1 on an
     # 8B on the same shared GPU.
     per_model_max_concurrent: dict[str, int] = field(default_factory=dict)
+    # Per-model overrides for ``completion_batch_size`` and
+    # ``prefill_step_size``. Same keying contract as
+    # ``per_model_max_concurrent``: basename or fully-qualified
+    # model_name. When a key is present, the value REPLACES the
+    # corresponding field on the Scheduler instance dedicated to that
+    # model; when absent, the global default is used. Lets operators
+    # decouple batch-fusion ceiling and prefill chunk sweet-spots per
+    # model on a shared GPU.
+    per_model_max_completion_batch_size: dict[str, int] = field(
+        default_factory=dict
+    )
+    per_model_prefill_step_size: dict[str, int] = field(default_factory=dict)
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
@@ -702,6 +714,30 @@ class Scheduler:
                 )
             if isinstance(override, int) and override > 0:
                 self.config.max_num_seqs = override
+
+        # Per-model batch-fusion + prefill-chunk overrides. Same keying
+        # contract as ``per_model_max_concurrent``: basename-first,
+        # full-name fallback. Each override REPLACES the field on the
+        # Scheduler instance dedicated to that model.
+        if self.config.model_name:
+            _model_id = os.path.basename(self.config.model_name.rstrip("/"))
+            for _source_dict, _target_attr in (
+                (
+                    self.config.per_model_max_completion_batch_size,
+                    "completion_batch_size",
+                ),
+                (
+                    self.config.per_model_prefill_step_size,
+                    "prefill_step_size",
+                ),
+            ):
+                if not _source_dict:
+                    continue
+                _override = _source_dict.get(_model_id)
+                if _override is None:
+                    _override = _source_dict.get(self.config.model_name)
+                if isinstance(_override, int) and _override > 0:
+                    setattr(self.config, _target_attr, _override)
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
