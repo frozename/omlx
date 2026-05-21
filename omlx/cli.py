@@ -587,6 +587,18 @@ Example directory structure:
         "N sequences. Useful on small GPUs under multi-model load where "
         "fused batches exceed the GPU watchdog timeout.",
     )
+    serve_parser.add_argument(
+        "--per-model-max-concurrent",
+        type=str,
+        default=None,
+        help="Per-model concurrency overrides. Comma-separated key=value pairs "
+        "where the key is the model id (basename of the model dir, e.g. "
+        "'Qwen3-8B-MLX-4bit') or the full model_name, and the value is the "
+        "max-concurrent-requests cap to use for THAT model. Models not "
+        "listed fall back to the global --max-concurrent-requests. Example: "
+        "--per-model-max-concurrent qwen3-8b=4,granite-3b=8 lets the smaller "
+        "model serve more parallel requests than a co-resident larger one.",
+    )
 
     # paged SSD cache options
     serve_parser.add_argument(
