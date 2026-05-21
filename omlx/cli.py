@@ -599,6 +599,29 @@ Example directory structure:
         "--per-model-max-concurrent qwen3-8b=4,granite-3b=8 lets the smaller "
         "model serve more parallel requests than a co-resident larger one.",
     )
+    serve_parser.add_argument(
+        "--per-model-max-completion-batch-size",
+        type=str,
+        default=None,
+        help="Per-model overrides for --max-completion-batch-size. Same "
+        "key=value,key=value shape as --per-model-max-concurrent. Models "
+        "without an entry fall back to the global "
+        "--max-completion-batch-size (which itself defaults to "
+        "--max-concurrent-requests). Different model sizes saturate at "
+        "different batch sizes; this lets operators tune them "
+        "independently while sharing one oMLX process.",
+    )
+    serve_parser.add_argument(
+        "--per-model-prefill-step-size",
+        type=str,
+        default=None,
+        help="Per-model overrides for prefill chunk size (default 2048). "
+        "Same key=value,key=value shape as --per-model-max-concurrent. "
+        "Smaller models tolerate smaller chunks (lower TTFT, more "
+        "scheduling overhead); larger models often want bigger chunks. "
+        "Models without an entry use the global default. Example: "
+        "--per-model-prefill-step-size granite-3b=512,qwen3-8b=2048",
+    )
 
     # paged SSD cache options
     serve_parser.add_argument(
