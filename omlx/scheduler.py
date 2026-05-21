@@ -4294,38 +4294,65 @@ class Scheduler:
         batch_specprefill_status: bool | None = None
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
-            # Admission pause: set by ProcessMemoryEnforcer when phys
-            # crosses soft_threshold. New prefills wait; in-flight requests
-            # continue. First request always passes (self.running is empty)
-            # so admission can recover by completing the current generation.
-            if self._admission_paused and self.running:
-                logger.debug(
-                    "Admission paused by memory pressure, %d running",
-                    len(self.running),
-                )
-                break
+            request = self.waiting.popleft()
 
-            # Generation memory guard: when requests are already running,
-            # defer scheduling if memory pressure is high to prevent
-            # Metal allocation failures during batch_generator.next().
-            # First request always passes (self.running is empty).
-            if (
+            # Memory-pressure admission: previously two pre-pop guards
+            # broke the entire loop when self._admission_paused was set
+            # OR when memory was over budget. Under sustained backpressure
+            # with a multi-request queue, this was head-of-line-blocking —
+            # none of the queued requests could progress until pressure
+            # cleared, even ones whose individual size would have fit.
+            #
+            # Refined per-request: pop the head, ask the existing
+            # _preflight_memory_check whether THIS request can fit, and on
+            # rejection finalize it with finish_reason='error' (same shape
+            # as the downstream preflight rejection at the bottom of the
+            # loop). Then ``continue`` to give the next waiter a chance.
+            # Requests whose preflight math says they still fit under the
+            # current budget get admitted; only over-budget requests get
+            # short-circuited.
+            #
+            # First request always passes because ``self.running`` is
+            # empty (admission can recover by completing the current
+            # generation), so this branch only fires once at least one
+            # request is in flight.
+            pressure_rejection: str | None = None
+            if self._admission_paused and self.running:
+                pressure_rejection = (
+                    self._preflight_memory_check(request)
+                    or "admission paused by memory pressure"
+                )
+            elif (
                 self._prefill_memory_guard
                 and self._memory_limit_bytes > 0
                 and self.running
             ):
                 current = max(mx.get_active_memory(), get_phys_footprint())
                 if current > self._memory_limit_bytes:
-                    logger.debug(
-                        "Generation memory guard: deferring scheduling "
-                        "(%s > %s), %d running",
-                        current,
-                        self._memory_limit_bytes,
-                        len(self.running),
+                    pressure_rejection = (
+                        self._preflight_memory_check(request)
+                        or (
+                            f"generation memory guard tripped "
+                            f"(current={current}, limit={self._memory_limit_bytes})"
+                        )
                     )
-                    break
 
-            request = self.waiting.popleft()
+            if pressure_rejection is not None:
+                logger.warning(
+                    "Request %s rejected under memory pressure: %s",
+                    request.request_id,
+                    pressure_rejection,
+                )
+                self.requests.pop(request.request_id, None)
+                rejected_outputs.append(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        finished=True,
+                        finish_reason="error",
+                        error=pressure_rejection,
+                    )
+                )
+                continue
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
