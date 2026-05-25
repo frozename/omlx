@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from .cache.model_arch import _model_uses_chunked_kv_cache
 from .config import parse_size
 
 if TYPE_CHECKING:
@@ -1164,7 +1165,14 @@ class GlobalSettings:
                             f"slot_save_path is not writable: {slot_path} ({e})"
                         )
 
-            if self.scheduler.max_concurrent_requests != 1:
+            requires_single_concurrency = True
+            model_dirs = self.model.get_model_dirs(self.base_path)
+            if len(model_dirs) == 1:
+                requires_single_concurrency = _model_uses_chunked_kv_cache(
+                    str(model_dirs[0])
+                )
+
+            if requires_single_concurrency and self.scheduler.max_concurrent_requests != 1:
                 errors.append(
                     "slot_save_path requires max_concurrent_requests=1 "
                     f"(got {self.scheduler.max_concurrent_requests})"

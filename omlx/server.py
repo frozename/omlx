@@ -157,6 +157,7 @@ from .api.tool_calling import (
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
+from .cache.model_arch import _model_uses_chunked_kv_cache
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -289,12 +290,38 @@ def _slot_runtime_enabled() -> bool:
     return bool(settings and getattr(settings, "slot_save_path", None))
 
 
-def _slot_invariant_violation_reason() -> str | None:
+def _slot_invariant_model_ref(model_id_or_dir: str | None = None) -> str | None:
+    candidate = model_id_or_dir
+    if candidate is None:
+        settings = _server_state.global_settings
+        if settings is None:
+            return None
+        model_dirs = settings.model.get_model_dirs(settings.base_path)
+        if len(model_dirs) != 1:
+            return None
+        candidate = str(model_dirs[0])
+
+    pool = _server_state.engine_pool
+    if pool is None:
+        return candidate
+
+    try:
+        resolved = resolve_model_id(candidate) or candidate
+    except Exception:
+        resolved = candidate
+    entry = pool.get_entry(resolved)
+    return entry.model_path if entry is not None else candidate
+
+
+def _slot_invariant_violation_reason(model_id_or_dir: str | None = None) -> str | None:
     settings = _server_state.global_settings
     if settings is None or not getattr(settings, "slot_save_path", None):
         return None
     max_concurrent = settings.scheduler.max_concurrent_requests
     if max_concurrent != 1:
+        model_ref = _slot_invariant_model_ref(model_id_or_dir)
+        if model_ref and not _model_uses_chunked_kv_cache(model_ref):
+            return None
         return (
             "slot_save_path requires max_concurrent_requests=1 "
             f"(got {max_concurrent})"
@@ -2288,13 +2315,6 @@ async def slot_action(
     if not _slot_runtime_enabled():
         raise HTTPException(status_code=404, detail="Slot API disabled")
 
-    violation = _slot_invariant_violation_reason()
-    if violation is not None:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "slot_invariant_violation", "reason": violation},
-        )
-
     if action not in SLOT_ALLOWED_ACTIONS:
         raise HTTPException(status_code=400, detail="Invalid action")
 
@@ -2316,6 +2336,13 @@ async def slot_action(
                     "message": str(exc),
                 }
             },
+        )
+
+    violation = _slot_invariant_violation_reason(resolved_model)
+    if violation is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "slot_invariant_violation", "reason": violation},
         )
 
     slot_store = _get_slot_store()
