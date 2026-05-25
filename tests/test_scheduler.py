@@ -522,7 +522,7 @@ class TestSchedulerOneShotBindApply:
             server_module._server_state.one_shot_bind_table = original_table
 
     @pytest.mark.asyncio
-    async def test_try_apply_one_shot_bind_raises_epoch_mismatch_and_consumes_bind(
+    async def test_try_apply_one_shot_bind_raises_epoch_mismatch_and_does_NOT_consume_bind(
         self, mock_model, mock_tokenizer
     ):
         import omlx.server as server_module
@@ -554,7 +554,8 @@ class TestSchedulerOneShotBindApply:
 
             with pytest.raises(SlotApplyEpochMismatch):
                 await scheduler.try_apply_one_shot_bind(request)
-            assert await table.consume_any("test-model", "handle-a") is None
+            assert await table.peek_any("test-model", "handle-a") is not None
+            assert await table.consume("test-model", "handle-a", "epoch-good") is not None
         finally:
             server_module._server_state.one_shot_bind_table = original_table
 

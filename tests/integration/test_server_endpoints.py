@@ -866,7 +866,7 @@ class TestSlotSaveEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
 
-    def test_v2_phase1a_save_default_handle_when_omitted_for_slot0(
+    def test_v2_5a_save_requires_explicit_handle_when_no_filename(
         self, tmp_path, mock_engine_pool, monkeypatch
     ):
         from omlx.server import app, _server_state
@@ -885,11 +885,9 @@ class TestSlotSaveEndpoint:
             client = TestClient(app)
 
             response = client.post("/slots/0?action=save", json={"model": "test-model"})
-            assert response.status_code == 200
-            body = response.json()
-            assert body["request_handle"] == "default"
-            assert body["filename"] == "default.kvslot"
-            assert (slot_dir / "default.kvslot").exists()
+            assert response.status_code == 400
+            detail = response.json()["detail"]["error"]
+            assert detail["code"] == "request_handle_required"
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
@@ -897,7 +895,7 @@ class TestSlotSaveEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
 
-    def test_v2_phase1a_save_filename_implies_handle(
+    def test_v2_5a_save_still_works_with_filename_alone(
         self, tmp_path, mock_engine_pool, monkeypatch
     ):
         from omlx.server import app, _server_state
@@ -923,6 +921,39 @@ class TestSlotSaveEndpoint:
             body = response.json()
             assert body["request_handle"] == "x"
             assert body["filename"] == "x.kvslot"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_5a_save_works_with_explicit_handle(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "abc"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["request_handle"] == "abc"
+            assert body["filename"] == "abc.kvslot"
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
@@ -1102,6 +1133,37 @@ class TestSlotRestoreEndpoint:
             "cache_class": "paged_ssd",
             "producer": {"mlx_version": "0.0.0", "omlx_cache_format_version": "v1"},
         }
+
+    def test_v2_5a_restore_requires_explicit_handle_when_no_filename(
+        self, tmp_path, mock_engine_pool
+    ):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model"},
+            )
+            assert response.status_code == 400
+            detail = response.json()["detail"]["error"]
+            assert detail["code"] == "request_handle_required"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
 
     def test_restore_rejects_absolute_path(self, tmp_path, mock_engine_pool):
         from omlx.server import _server_state, app
@@ -1879,6 +1941,156 @@ class TestSlotRestoreEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
             _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_5a_chat_completion_with_bogus_handle_returns_409(
+        self, tmp_path, mock_engine_pool
+    ):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            _server_state.one_shot_bind_table = OneShotBindTable()
+            client = TestClient(app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "bogus",
+                    "x_omlx_restore_epoch": "epoch-a",
+                },
+            )
+            assert response.status_code == 409
+            detail = response.json()["error"]
+            assert detail["code"] == "slot_handle_not_found"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_5a_chat_completion_with_wrong_epoch_returns_409(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                lambda *args, **kwargs: (
+                    b"payload",
+                    {
+                        "n_tokens": 6,
+                        "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                        "cache_class": "paged_ssd",
+                    },
+                ),
+            )
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 6)
+            client = TestClient(app)
+
+            assert client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            ).status_code == 200
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert restore_response.status_code == 200
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": "wrong-epoch",
+                },
+            )
+            assert response.status_code == 409
+            detail = response.json()["error"]
+            assert detail["code"] == "slot_apply_epoch_mismatch"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_5a_streaming_chat_completion_with_bogus_handle_returns_409_BEFORE_stream_starts(
+        self, tmp_path, mock_engine_pool
+    ):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            _server_state.one_shot_bind_table = OneShotBindTable()
+            client = TestClient(app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "bogus",
+                    "x_omlx_restore_epoch": "epoch-a",
+                },
+            )
+            assert response.status_code == 409
+            assert "data:" not in response.text
+            detail = response.json()["error"]
+            assert detail["code"] == "slot_handle_not_found"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_5a_chat_completion_without_slot_fields_unchanged(self, client):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert response.status_code == 200
 
     def test_v2_phase2_n_saved_equals_cached_tokens(
         self, tmp_path, mock_engine_pool, monkeypatch

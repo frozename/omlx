@@ -195,7 +195,6 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 SLOT_API_VERSION = "0.1.0"
 SLOT_ALLOWED_ACTIONS = {"save", "restore"}
-DEFAULT_SLOT_REQUEST_HANDLE = "default"
 
 
 # =============================================================================
@@ -339,9 +338,17 @@ def _resolve_slot_request_handle_and_filename(
         return filename.removesuffix(".kvslot"), filename
 
     if slot_id == 0:
-        return DEFAULT_SLOT_REQUEST_HANDLE, f"{DEFAULT_SLOT_REQUEST_HANDLE}.kvslot"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "request_handle_required",
+                    "message": "request_handle or filename is required",
+                }
+            },
+        )
 
-    raise HTTPException(status_code=400, detail="Invalid filename")
+    raise HTTPException(status_code=400, detail="invalid_request_handle")
 
 
 def get_mcp_manager():
@@ -1307,6 +1314,86 @@ def _slot_apply_http_detail(
             },
         }
     }
+
+
+async def _preflight_chat_slot_apply(
+    *,
+    model_id: str,
+    request_handle: str | None,
+    restore_epoch: str | None,
+) -> None:
+    """Validate one-shot bind request before chat execution starts."""
+    if request_handle is None:
+        return
+
+    if not restore_epoch:
+        raise SlotApplyEpochMismatch(
+            model_id=model_id or (_server_state.default_model or ""),
+            request_handle=request_handle,
+            expected_epoch="<required>",
+            observed_epoch=None,
+        )
+
+    table = getattr(_server_state, "one_shot_bind_table", None)
+    if table is None:
+        raise SlotApplyHandleNotFound(
+            model_id=model_id or (_server_state.default_model or ""),
+            request_handle=request_handle,
+        )
+
+    model_candidates: list[str] = []
+    if model_id:
+        model_candidates.append(model_id)
+        model_candidates.append(os.path.basename(model_id.rstrip("/")))
+    if _server_state.default_model:
+        model_candidates.append(_server_state.default_model)
+
+    bind: OneShotBind | None = None
+    bind_model_id = model_id
+    seen: set[str] = set()
+    for candidate in model_candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        bind = await table.peek_any(candidate, request_handle)
+        if bind is not None:
+            bind_model_id = candidate
+            break
+
+    if bind is None:
+        raise SlotApplyHandleNotFound(
+            model_id=model_id or (_server_state.default_model or ""),
+            request_handle=request_handle,
+        )
+
+    if restore_epoch != bind.restore_epoch:
+        raise SlotApplyEpochMismatch(
+            model_id=bind_model_id or bind.model_id,
+            request_handle=request_handle,
+            expected_epoch=bind.restore_epoch,
+            observed_epoch=restore_epoch,
+        )
+
+    try:
+        entry = _slot_entry_for_model(bind.model_id)
+        current_fingerprint = await asyncio.to_thread(
+            compute_model_fingerprint,
+            Path(entry.model_path),
+        )
+        current_ctx_size = _slot_ctx_size_for_model(bind.model_id)
+        check_restore_guards(
+            manifest=bind.manifest,
+            current_fingerprint=current_fingerprint,
+            current_ctx_size=current_ctx_size,
+        )
+    except SlotGuardMismatch as exc:
+        raise SlotApplyGuardMismatch(
+            field=exc.field,
+            expected=exc.expected,
+            observed=exc.observed,
+            model_id=bind.model_id,
+            request_handle=request_handle,
+        ) from exc
 
 
 def get_max_context_window(model_id: str | None = None) -> int | None:
@@ -2885,6 +2972,19 @@ async def create_chat_completion(
         chat_kwargs["x_omlx_model_id"] = resolved_model
     if request.x_omlx_restore_epoch is not None:
         chat_kwargs["x_omlx_restore_epoch"] = request.x_omlx_restore_epoch
+
+    try:
+        await _preflight_chat_slot_apply(
+            model_id=resolved_model,
+            request_handle=request.x_omlx_request_handle,
+            restore_epoch=request.x_omlx_restore_epoch,
+        )
+    except (
+        SlotApplyEpochMismatch,
+        SlotApplyHandleNotFound,
+        SlotApplyGuardMismatch,
+    ) as exc:
+        return JSONResponse(status_code=409, content=_slot_apply_http_detail(exc))
 
     if request.stream:
         return StreamingResponse(

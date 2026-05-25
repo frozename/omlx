@@ -139,19 +139,27 @@ class OneShotBindTable:
     async def consume(
         self, model_id: str, request_handle: str, restore_epoch: str
     ) -> OneShotBind | None:
+        """Atomically consume only when the entry exists and epoch matches."""
         key = (model_id, request_handle)
         async with self._guard:
-            bind = self._entries.pop(key, None)
+            bind = self._entries.get(key)
             if bind is None:
                 return None
             if bind.restore_epoch != restore_epoch:
                 return None
-            return bind
+            return self._entries.pop(key, None)
 
     async def consume_any(self, model_id: str, request_handle: str) -> OneShotBind | None:
+        """Deprecated: consumes by key without epoch validation."""
         key = (model_id, request_handle)
         async with self._guard:
             return self._entries.pop(key, None)
+
+    async def peek_any(self, model_id: str, request_handle: str) -> OneShotBind | None:
+        """Return entry by key without removing it."""
+        key = (model_id, request_handle)
+        async with self._guard:
+            return self._entries.get(key)
 
     async def drain(self) -> int:
         """Clear all entries; log each as slot_apply_drain_on_disable. Returns count."""

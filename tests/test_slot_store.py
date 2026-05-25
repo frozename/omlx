@@ -400,7 +400,7 @@ def test_v2a_apply_n_restored_falls_back_to_manifest_when_metadata_missing():
 
 
 @pytest.mark.asyncio
-async def test_one_shot_bind_put_consume_returns_entry_with_matching_epoch():
+async def test_consume_with_matching_epoch_returns_entry_and_removes_it():
     table = OneShotBindTable()
     bind = OneShotBind(
         model_id="m",
@@ -413,17 +413,18 @@ async def test_one_shot_bind_put_consume_returns_entry_with_matching_epoch():
 
     consumed = await table.consume("m", "h", "epoch-1")
     assert consumed == bind
+    assert await table.consume_any("m", "h") is None
 
 
 @pytest.mark.asyncio
-async def test_one_shot_bind_consume_returns_none_on_no_entry():
+async def test_consume_with_no_entry_returns_none():
     table = OneShotBindTable()
     consumed = await table.consume("m", "missing", "epoch-1")
     assert consumed is None
 
 
 @pytest.mark.asyncio
-async def test_one_shot_bind_consume_returns_none_on_epoch_mismatch_and_drops_entry():
+async def test_consume_with_mismatched_epoch_returns_none_and_LEAVES_entry():
     table = OneShotBindTable()
     bind = OneShotBind(
         model_id="m",
@@ -436,6 +437,30 @@ async def test_one_shot_bind_consume_returns_none_on_epoch_mismatch_and_drops_en
 
     consumed = await table.consume("m", "h", "wrong")
     assert consumed is None
+    still_present = await table.peek_any("m", "h")
+    assert still_present == bind
+    later = await table.consume("m", "h", "expected")
+    assert later == bind
+
+
+@pytest.mark.asyncio
+async def test_consume_concurrent_correct_and_wrong_epoch_correct_still_wins():
+    table = OneShotBindTable()
+    bind = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"abc",
+        manifest=_manifest(n_tokens=9),
+        restore_epoch="epoch-1",
+    )
+    await table.put(bind)
+
+    wrong, correct = await asyncio.gather(
+        table.consume("m", "h", "wrong"),
+        table.consume("m", "h", "epoch-1"),
+    )
+    assert wrong is None
+    assert correct == bind
     assert await table.consume_any("m", "h") is None
 
 

@@ -3325,18 +3325,42 @@ class Scheduler:
             model_candidates.append(_server_state.default_model)
 
         seen: set[str] = set()
+        ordered_candidates: list[str] = []
         bind = None
         model_id = ""
         for candidate in model_candidates:
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
-            bind = await table.consume_any(candidate, request_handle)
+            ordered_candidates.append(candidate)
+            bind = await table.consume(
+                candidate,
+                request_handle,
+                request.x_omlx_restore_epoch,
+            )
             if bind is not None:
                 model_id = candidate
                 break
 
         if bind is None:
+            for candidate in ordered_candidates:
+                parked = await table.peek_any(candidate, request_handle)
+                if parked is None:
+                    continue
+                logger.info(
+                    "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
+                    candidate or parked.model_id,
+                    request_handle,
+                    parked.restore_epoch,
+                    request.x_omlx_restore_epoch,
+                )
+                raise SlotApplyEpochMismatch(
+                    model_id=candidate or parked.model_id,
+                    request_handle=request_handle,
+                    expected_epoch=parked.restore_epoch,
+                    observed_epoch=request.x_omlx_restore_epoch,
+                )
+
             logger.info(
                 "[slot_apply_miss_handle_not_found] model_id=%s request_handle=%s",
                 request.x_omlx_model_id or (_server_state.default_model or ""),
@@ -3345,20 +3369,6 @@ class Scheduler:
             raise SlotApplyHandleNotFound(
                 model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
                 request_handle=request_handle,
-            )
-        if request.x_omlx_restore_epoch != bind.restore_epoch:
-            logger.info(
-                "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
-                model_id or bind.model_id,
-                request_handle,
-                bind.restore_epoch,
-                request.x_omlx_restore_epoch,
-            )
-            raise SlotApplyEpochMismatch(
-                model_id=model_id or bind.model_id,
-                request_handle=request_handle,
-                expected_epoch=bind.restore_epoch,
-                observed_epoch=request.x_omlx_restore_epoch,
             )
 
         try:
