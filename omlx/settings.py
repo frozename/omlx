@@ -25,9 +25,10 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from .config import parse_size
 
@@ -704,6 +705,7 @@ class GlobalSettings:
     model: ModelSettings = field(default_factory=ModelSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
+    slot_save_path: Optional[str] = None
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
@@ -785,6 +787,8 @@ class GlobalSettings:
                 self.memory = MemorySettings.from_dict(data["memory"])
             if "scheduler" in data:
                 self.scheduler = SchedulerSettings.from_dict(data["scheduler"])
+            if "slot_save_path" in data:
+                self.slot_save_path = data["slot_save_path"]
             if "cache" in data:
                 self.cache = CacheSettings.from_dict(data["cache"])
             if "auth" in data:
@@ -853,6 +857,8 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_MAX_CONCURRENT_REQUESTS value: {max_concurrent}"
                 )
+        if slot_save_path := os.getenv("OMLX_SLOT_SAVE_PATH"):
+            self.slot_save_path = slot_save_path
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -944,6 +950,8 @@ class GlobalSettings:
             and args.max_concurrent_requests is not None
         ):
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
+        if hasattr(args, "slot_save_path") and args.slot_save_path is not None:
+            self.slot_save_path = args.slot_save_path
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -995,6 +1003,7 @@ class GlobalSettings:
             "model": self.model.to_dict(),
             "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
+            "slot_save_path": self.slot_save_path,
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
@@ -1117,6 +1126,29 @@ class GlobalSettings:
                 f"Invalid max_concurrent_requests: "
                 f"{self.scheduler.max_concurrent_requests} (must be > 0)"
             )
+        if self.slot_save_path:
+            slot_path = Path(self.slot_save_path).expanduser().resolve()
+            try:
+                slot_path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                errors.append(f"slot_save_path is not usable: {slot_path} ({e})")
+            else:
+                if not slot_path.is_dir():
+                    errors.append(f"slot_save_path is not a directory: {slot_path}")
+                else:
+                    try:
+                        with tempfile.NamedTemporaryFile(dir=slot_path, delete=True):
+                            pass
+                    except OSError as e:
+                        errors.append(
+                            f"slot_save_path is not writable: {slot_path} ({e})"
+                        )
+
+            if self.scheduler.max_concurrent_requests != 1:
+                errors.append(
+                    "slot_save_path requires max_concurrent_requests=1 "
+                    f"(got {self.scheduler.max_concurrent_requests})"
+                )
 
         # Cache validation
         if self.cache.ssd_cache_max_size.lower() != "auto":
@@ -1235,6 +1267,7 @@ class GlobalSettings:
             "model": self.model.to_dict(),
             "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
+            "slot_save_path": self.slot_save_path,
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),

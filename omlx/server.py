@@ -49,9 +49,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
+from fastapi import Depends, FastAPI, HTTPException, Query, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -176,6 +177,8 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
+SLOT_API_VERSION = "0.1.0"
+SLOT_ALLOWED_ACTIONS = {"save", "restore"}
 
 
 # =============================================================================
@@ -227,6 +230,9 @@ class ServerState:
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
+    # Slot lifecycle state lives at the server boundary so slot HTTP handlers
+    # can enforce invariants before scheduler integration lands in Phase B.
+    slot_states: dict[int, str] = field(default_factory=lambda: {0: "IDLE"})
 
 
 # Global server state instance
@@ -243,6 +249,37 @@ def get_engine_pool() -> EnginePool:
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
     return _server_state.engine_pool
+
+
+def _slot_runtime_enabled() -> bool:
+    settings = _server_state.global_settings
+    return bool(settings and getattr(settings, "slot_save_path", None))
+
+
+def _slot_invariant_violation_reason() -> str | None:
+    settings = _server_state.global_settings
+    if settings is None or not getattr(settings, "slot_save_path", None):
+        return None
+    max_concurrent = settings.scheduler.max_concurrent_requests
+    if max_concurrent != 1:
+        return (
+            "slot_save_path requires max_concurrent_requests=1 "
+            f"(got {max_concurrent})"
+        )
+    return None
+
+
+def _is_valid_slot_filename(filename: object) -> bool:
+    if not isinstance(filename, str) or not filename:
+        return False
+    path = Path(filename)
+    if path.is_absolute():
+        return False
+    if any(part == ".." for part in path.parts):
+        return False
+    if len(path.parts) != 1:
+        return False
+    return True
 
 
 def get_mcp_manager():
@@ -1129,6 +1166,16 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    violation = _slot_invariant_violation_reason()
+    if violation is not None:
+        logger.error("Slot API startup invariant violation: %s", violation)
+        raise ValueError(violation)
+    if _slot_runtime_enabled():
+        logger.warning(
+            "Slot API enabled at %s (Phase A skeleton; save/restore currently return 501)",
+            global_settings.slot_save_path,
+        )
+
     response_state_dir = None
     if global_settings:
         response_state_dir = (
@@ -1615,6 +1662,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
     return {
         "status": "ok",
         "version": __version__,
+        "slot_api_version": SLOT_API_VERSION,
         "uptime_seconds": snapshot["uptime_seconds"],
         "models_discovered": models_discovered,
         "models_loaded": models_loaded,
@@ -1660,6 +1708,59 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             )
 
     return ModelsResponse(data=models)
+
+
+@app.get("/v1/slots/capabilities")
+async def slot_capabilities(_: bool = Depends(verify_api_key)):
+    settings = _server_state.global_settings
+    max_concurrent = (
+        settings.scheduler.max_concurrent_requests if settings is not None else 0
+    )
+    return {
+        "slot_api_version": SLOT_API_VERSION,
+        "actions": ["save", "restore"],
+        "slot_count": 1,
+        "max_concurrent_requests": max_concurrent,
+        "slot_save_path_configured": _slot_runtime_enabled(),
+    }
+
+
+@app.post("/slots/{slot_id}")
+async def slot_action(
+    slot_id: int,
+    action: str | None = Query(default=None),
+    payload: dict[str, object] | None = None,
+    _: bool = Depends(verify_api_key),
+):
+    if slot_id != 0:
+        raise HTTPException(status_code=404, detail="Slot not found")
+
+    if not _slot_runtime_enabled():
+        raise HTTPException(status_code=404, detail="Slot API disabled")
+
+    violation = _slot_invariant_violation_reason()
+    if violation is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "slot_invariant_violation", "reason": violation},
+        )
+
+    if action not in SLOT_ALLOWED_ACTIONS:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    filename = payload.get("filename") if isinstance(payload, dict) else None
+    if not _is_valid_slot_filename(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    return JSONResponse(
+        status_code=501,
+        content={
+            "error": "not_implemented",
+            "action": action,
+            "id_slot": slot_id,
+            "filename": filename,
+        },
+    )
 
 
 @app.get("/v1/models/status")

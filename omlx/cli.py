@@ -51,6 +51,8 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
         return True
+    if hasattr(args, "slot_save_path") and args.slot_save_path is not None:
+        return True
     return False
 
 
@@ -163,6 +165,11 @@ def serve_command(args):
         for error in errors:
             print(f"Configuration error: {error}")
         sys.exit(1)
+    if settings.slot_save_path:
+        logging.getLogger("omlx").warning(
+            "Slot API enabled at %s (Phase A skeleton; save/restore currently return 501)",
+            settings.slot_save_path,
+        )
 
     # Import server and config
     from .server import app, init_server
@@ -574,6 +581,12 @@ Example directory structure:
         type=int,
         default=None,
         help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--slot-save-path",
+        type=str,
+        default=None,
+        help="Directory for slot save/restore snapshots (enables /slots API skeleton)",
     )
 
     # paged SSD cache options
