@@ -1384,6 +1384,28 @@ def _slot_apply_http_detail(
     }
 
 
+def _sanitize_slot_apply_runtime_message(exc: Exception) -> str:
+    """Sanitize runtime exception text for slot-apply HTTP surfaces."""
+    message = str(exc).replace("\n", " ").replace("\r", " ").strip()
+    if not message:
+        message = "slot apply failed at runtime"
+    if len(message) > 300:
+        message = f"{message[:297]}..."
+    return message
+
+
+def _slot_apply_runtime_http_detail(exc: Exception) -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "slot_apply_runtime_error",
+            "message": _sanitize_slot_apply_runtime_message(exc),
+            "details": {
+                "exception_type": exc.__class__.__name__,
+            },
+        }
+    }
+
+
 async def _preflight_chat_slot_apply(
     *,
     model_id: str,
@@ -3104,6 +3126,13 @@ async def create_chat_completion(
             SlotApplyGuardMismatch,
         ) as exc:
             raise HTTPException(status_code=409, detail=_slot_apply_http_detail(exc))
+        except Exception as exc:
+            if request.x_omlx_request_handle is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_slot_apply_runtime_http_detail(exc),
+                ) from exc
+            raise
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0

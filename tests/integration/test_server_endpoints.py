@@ -2018,7 +2018,7 @@ class TestSlotRestoreEndpoint:
                 bind = table._entries[key]  # noqa: SLF001
                 scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
                 scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
-                applied = await scheduler.try_apply_one_shot_bind(req)
+                applied = scheduler.try_apply_one_shot_bind(req)
                 return MockGenerationOutput(
                     text="Chat response.",
                     prompt_tokens=7,
@@ -2057,6 +2057,204 @@ class TestSlotRestoreEndpoint:
             assert response.status_code == 200, response.text
             body = response.json()
             assert body["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_6a_real_impl_roundtrip_and_runtime_apply_error_envelope(
+        self, tmp_path, mock_engine_pool, mock_llm_engine
+    ):
+        import asyncio
+        import os
+        import tempfile
+
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache, save_prompt_cache
+        from omlx.scheduler import SchedulerConfig
+        from omlx.server import _server_state, app
+        from omlx.slot_store import (
+            OneShotBind,
+            SlotManifest,
+            compute_model_fingerprint,
+            hash_prompt_token_prefix,
+        )
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+        paged_cache_dir = tmp_path / "paged-cache"
+        paged_cache_dir.mkdir()
+        model_dir = tmp_path / "model-artifacts"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model":"test-model"}', encoding="utf-8")
+
+        class _Model:
+            layers = [object()]
+
+        scheduler = Scheduler(
+            model=_Model(),
+            tokenizer=MockTokenizer(),
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(paged_cache_dir),
+                paged_cache_block_size=2,
+                initial_cache_blocks=8,
+                max_cache_blocks=32,
+                model_name="test-model",
+            ),
+        )
+        assert scheduler.block_aware_cache is not None
+
+        prompt_tokens = [11, 12, 13, 14]
+        cache = KVCache()
+        keys = mx.full((1, 1, len(prompt_tokens), 2), 1, dtype=mx.float16)
+        values = mx.full((1, 1, len(prompt_tokens), 2), 2, dtype=mx.float16)
+        cache.update_and_fetch(keys, values)
+
+        class _Entry:
+            def __init__(self, path):
+                self.model_path = str(path)
+                self.engine = None
+                self.preserve_thinking_default = False
+
+        entry = _Entry(model_dir)
+        table = OneShotBindTable()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            mock_engine_pool.get_entry = lambda _model_id: entry
+            mock_engine_pool.resolve_model_id = (
+                lambda model_id_or_alias, settings_manager=None: model_id_or_alias
+            )
+            with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+                payload_path = tmp.name
+            try:
+                save_prompt_cache(
+                    payload_path,
+                    [cache],
+                    metadata={
+                        "model_id": "test-model",
+                        "cached_tokens": str(len(prompt_tokens)),
+                    },
+                )
+                with open(payload_path, "rb") as f:
+                    payload_bytes = f.read()
+            finally:
+                try:
+                    os.unlink(payload_path)
+                except OSError:
+                    pass
+            metadata = {
+                "n_tokens": len(prompt_tokens),
+                "tensors": [{"name": "layer_0", "dtype": "float16", "shape": [1, 1, 4, 2]}],
+                "cache_class": "KVCache",
+                "prompt_prefix_sha256": hash_prompt_token_prefix(prompt_tokens),
+            }
+            manifest = SlotManifest(
+                slot_format_version=2,
+                model_fingerprint=compute_model_fingerprint(model_dir),
+                model_id="test-model",
+                ctx_size=_server_state.sampling.max_context_window,
+                n_tokens=int(metadata["n_tokens"]),
+                tensors=list(metadata["tensors"]),
+                cache_class=str(metadata["cache_class"]),
+                producer={"mlx_version": "0.0.0", "omlx_cache_format_version": "v1"},
+                prompt_prefix_sha256=metadata.get("prompt_prefix_sha256"),
+            )
+            _server_state.one_shot_bind_table = table
+
+            async def fake_chat(messages, **kwargs):
+                del messages
+                req = Request(
+                    request_id="req-v26a",
+                    prompt=prompt_tokens + [99],
+                    sampling_params=SamplingParams(max_tokens=16),
+                    x_omlx_request_handle=kwargs.get("x_omlx_request_handle"),
+                    x_omlx_restore_epoch=kwargs.get("x_omlx_restore_epoch"),
+                    x_omlx_model_id=kwargs.get("x_omlx_model_id"),
+                )
+                req.prompt_token_ids = list(prompt_tokens + [99])
+                applied = scheduler.try_apply_one_shot_bind(req)
+                return MockGenerationOutput(
+                    text="Chat response.",
+                    prompt_tokens=len(req.prompt_token_ids),
+                    completion_tokens=2,
+                    finish_reason="stop",
+                    finished=True,
+                    cached_tokens=req.cached_tokens if applied else 0,
+                )
+
+            mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)
+            client = TestClient(app)
+
+            asyncio.run(
+                table.put(
+                    OneShotBind(
+                        model_id="test-model",
+                        request_handle="roundtrip",
+                        payload_bytes=payload_bytes,
+                        manifest=manifest,
+                        restore_epoch="epoch-ok",
+                    )
+                )
+            )
+            ok_response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": "epoch-ok",
+                },
+            )
+            assert ok_response.status_code == 200, ok_response.text
+            assert (
+                ok_response.json()["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+            )
+
+            asyncio.run(
+                table.put(
+                    OneShotBind(
+                        model_id="test-model",
+                        request_handle="roundtrip",
+                        payload_bytes=payload_bytes[:32],
+                        manifest=manifest,
+                        restore_epoch="epoch-bad",
+                    )
+                )
+            )
+            bad_response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": "epoch-bad",
+                },
+            )
+            assert bad_response.status_code == 409, bad_response.text
+            payload = bad_response.json()
+            detail = None
+            if isinstance(payload.get("detail"), dict):
+                detail_payload = payload["detail"]
+                if isinstance(detail_payload.get("error"), dict):
+                    detail = detail_payload["error"]
+            if detail is None and isinstance(payload.get("error"), dict):
+                detail = payload["error"]
+                nested = detail.get("message")
+                if isinstance(nested, dict) and isinstance(nested.get("error"), dict):
+                    detail = nested["error"]
+            assert isinstance(detail, dict)
+            assert detail["code"] == "slot_apply_runtime_error"
+            assert detail["details"]["exception_type"]
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
@@ -2125,7 +2323,7 @@ class TestSlotRestoreEndpoint:
                 bind = _server_state.one_shot_bind_table._entries[("test-model", "roundtrip")]  # noqa: SLF001
                 scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
                 scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
-                applied = await scheduler.try_apply_one_shot_bind(req)
+                applied = scheduler.try_apply_one_shot_bind(req)
                 return MockGenerationOutput(
                     text="Chat response.",
                     prompt_tokens=len(prompt),
@@ -2237,7 +2435,7 @@ class TestSlotRestoreEndpoint:
                 scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
                 bind = _server_state.one_shot_bind_table._entries[("test-model", "roundtrip")]  # noqa: SLF001
                 scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
-                await scheduler.try_apply_one_shot_bind(req)
+                scheduler.try_apply_one_shot_bind(req)
                 return MockGenerationOutput(text="unused")
 
             mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)
@@ -2301,7 +2499,7 @@ class TestSlotRestoreEndpoint:
                     x_omlx_model_id=kwargs.get("x_omlx_model_id"),
                 )
                 req.prompt_token_ids = [1, 2, 3]
-                await scheduler.try_apply_one_shot_bind(req)
+                scheduler.try_apply_one_shot_bind(req)
                 return MockGenerationOutput(text="unused")
 
             mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)

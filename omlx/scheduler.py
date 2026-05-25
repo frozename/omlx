@@ -3290,7 +3290,7 @@ class Scheduler:
             except OSError:
                 pass
 
-    async def try_apply_one_shot_bind(self, request: Request) -> bool:
+    def try_apply_one_shot_bind(self, request: Request) -> bool:
         """Attempt one-shot bind apply and consume if request is tagged."""
         request_handle = request.x_omlx_request_handle
         if not request_handle:
@@ -3335,18 +3335,19 @@ class Scheduler:
                 continue
             seen.add(candidate)
             ordered_candidates.append(candidate)
-            bind = await table.consume(
-                candidate,
-                request_handle,
-                request.x_omlx_restore_epoch,
-            )
+            key = (candidate, request_handle)
+            parked = table._entries.get(key)  # noqa: SLF001
+            if parked is None:
+                continue
+            if parked.restore_epoch == request.x_omlx_restore_epoch:
+                bind = table._entries.pop(key, None)  # noqa: SLF001
             if bind is not None:
                 model_id = candidate
                 break
 
         if bind is None:
             for candidate in ordered_candidates:
-                parked = await table.peek_any(candidate, request_handle)
+                parked = table._entries.get((candidate, request_handle))  # noqa: SLF001
                 if parked is None:
                     continue
                 logger.info(
@@ -3487,13 +3488,7 @@ class Scheduler:
 
         one_shot_applied = False
         if request.x_omlx_request_handle is not None:
-            loop = asyncio.new_event_loop()
-            try:
-                one_shot_applied = loop.run_until_complete(
-                    self.try_apply_one_shot_bind(request)
-                )
-            finally:
-                loop.close()
+            one_shot_applied = self.try_apply_one_shot_bind(request)
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None and not one_shot_applied:

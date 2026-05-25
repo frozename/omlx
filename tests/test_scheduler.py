@@ -417,7 +417,7 @@ class TestSchedulerOneShotBindApply:
         )
         request.prompt_token_ids = [10, 11, 12]
 
-        applied = await scheduler.try_apply_one_shot_bind(request)
+        applied = scheduler.try_apply_one_shot_bind(request)
         assert applied is False
 
     @pytest.mark.asyncio
@@ -454,7 +454,7 @@ class TestSchedulerOneShotBindApply:
             scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
 
             with caplog.at_level("INFO"):
-                applied = await scheduler.try_apply_one_shot_bind(request)
+                applied = scheduler.try_apply_one_shot_bind(request)
 
             assert applied is True
             assert any("slot_apply_success" in record.message for record in caplog.records)
@@ -494,7 +494,7 @@ class TestSchedulerOneShotBindApply:
             scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
             scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
 
-            applied = await scheduler.try_apply_one_shot_bind(request)
+            applied = scheduler.try_apply_one_shot_bind(request)
             assert applied is True
             assert request.prompt_cache == ["cache-ok"]
             assert request.cached_tokens == 3
@@ -525,7 +525,7 @@ class TestSchedulerOneShotBindApply:
             request.prompt_token_ids = [1, 2, 3]
             with caplog.at_level("INFO"):
                 with pytest.raises(SlotApplyHandleNotFound):
-                    await scheduler.try_apply_one_shot_bind(request)
+                    scheduler.try_apply_one_shot_bind(request)
             assert any("slot_apply_miss_handle_not_found" in record.message for record in caplog.records)
         finally:
             server_module._server_state.one_shot_bind_table = original_table
@@ -562,7 +562,7 @@ class TestSchedulerOneShotBindApply:
             request.prompt_token_ids = [1, 2, 3]
 
             with pytest.raises(SlotApplyEpochMismatch):
-                await scheduler.try_apply_one_shot_bind(request)
+                scheduler.try_apply_one_shot_bind(request)
             assert await table.peek_any("test-model", "handle-a") is not None
             assert await table.consume("test-model", "handle-a", "epoch-good") is not None
         finally:
@@ -601,7 +601,7 @@ class TestSchedulerOneShotBindApply:
 
             with caplog.at_level("INFO"):
                 with pytest.raises(SlotApplyEpochMismatch):
-                    await scheduler.try_apply_one_shot_bind(request)
+                    scheduler.try_apply_one_shot_bind(request)
             assert any("slot_apply_miss_epoch_mismatch" in record.message for record in caplog.records)
         finally:
             server_module._server_state.one_shot_bind_table = original_table
@@ -627,7 +627,7 @@ class TestSchedulerOneShotBindApply:
             )
             request.prompt_token_ids = [1, 2, 3]
             with pytest.raises(SlotApplyHandleNotFound):
-                await scheduler.try_apply_one_shot_bind(request)
+                scheduler.try_apply_one_shot_bind(request)
         finally:
             server_module._server_state.one_shot_bind_table = original_table
 
@@ -667,7 +667,7 @@ class TestSchedulerOneShotBindApply:
 
             with caplog.at_level("INFO"):
                 with pytest.raises(SlotApplyGuardMismatch) as exc:
-                    await scheduler.try_apply_one_shot_bind(request)
+                    scheduler.try_apply_one_shot_bind(request)
             assert exc.value.field == "model_fingerprint"
             assert any("slot_apply_miss_guard_mismatch" in record.message for record in caplog.records)
         finally:
@@ -708,7 +708,7 @@ class TestSchedulerOneShotBindApply:
             scheduler._current_slot_restore_guards = lambda _model_id: ("fp-b", 32768)  # type: ignore[method-assign]
 
             with pytest.raises(SlotApplyGuardMismatch) as exc:
-                await scheduler.try_apply_one_shot_bind(request)
+                scheduler.try_apply_one_shot_bind(request)
             assert exc.value.field == "model_fingerprint"
             assert await table.consume_any("test-model", "handle-a") is None
         finally:
@@ -754,7 +754,7 @@ class TestSchedulerOneShotBindApply:
             scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
 
             with pytest.raises(SlotApplyGuardMismatch) as exc:
-                await scheduler.try_apply_one_shot_bind(request)
+                scheduler.try_apply_one_shot_bind(request)
             assert exc.value.field == "prompt_prefix"
         finally:
             server_module._server_state.one_shot_bind_table = original_table
@@ -799,7 +799,7 @@ class TestSchedulerOneShotBindApply:
             scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
             scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
 
-            applied = await scheduler.try_apply_one_shot_bind(request)
+            applied = scheduler.try_apply_one_shot_bind(request)
             assert applied is True
             assert request.cached_tokens == 3
             assert request.remaining_tokens == [4, 5]
@@ -841,7 +841,7 @@ class TestSchedulerOneShotBindApply:
             scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
 
             with caplog.at_level("WARNING"):
-                applied = await scheduler.try_apply_one_shot_bind(request)
+                applied = scheduler.try_apply_one_shot_bind(request)
             assert applied is True
             assert any(
                 "slot_apply_legacy_no_prefix_guard" in record.message
