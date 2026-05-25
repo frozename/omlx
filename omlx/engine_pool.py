@@ -43,6 +43,7 @@ from .exceptions import (
 from .model_discovery import DiscoveredModel, discover_models, format_size
 from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
+from .slot_store import OneShotBindTableProtocol
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,9 @@ class EnginePool:
         *,
         slot_lookup_fn: Callable[[str], object] | None = None,
         slot_ctx_size_fn: Callable[[str], int] | None = None,
-        one_shot_bind_table_getter: Callable[[], object | None] | None = None,
+        one_shot_bind_table_getter: (
+            Callable[[], OneShotBindTableProtocol | None] | None
+        ) = None,
         default_model_getter: Callable[[], str | None] | None = None,
     ):
         """

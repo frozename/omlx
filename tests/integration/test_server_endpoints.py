@@ -2330,6 +2330,7 @@ class TestSlotRestoreEndpoint:
             assert detail["message"] == "slot apply failed"
             assert detail["details"]["message"] == "slot apply failed"
             assert detail["details"]["exception_type"] == "SlotApplyRuntimeError"
+            assert detail["details"]["reason"] == "deserialize_failed"
             assert "runtime-apply-inner-detail" not in bad_response.text
             assert "runtime-apply-inner-detail" in caplog.text
             assert "correlation_id=roundtrip:epoch-bad" in caplog.text

@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Protocol, runtime_checkable
 
 
 class SlotState(Enum):
@@ -113,6 +113,23 @@ class SlotApplyGuardMismatch(RuntimeError):
 class SlotApplyRuntimeError(RuntimeError):
     """Raised for non-classified runtime failures during one-shot slot apply."""
 
+    def __init__(
+        self,
+        message: str = "slot apply failed",
+        *,
+        reason: str = "unknown",
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class SlotApplyRuntimeReason(str, Enum):
+    DESERIALIZE_FAILED = "deserialize_failed"
+    PAYLOAD_INVALID = "payload_invalid"
+    GUARD_EVAL_FAILED = "guard_eval_failed"
+    ENGINE_UNAVAILABLE = "engine_unavailable"
+    UNKNOWN = "unknown"
+
 
 class SlotSaveRuntimeError(RuntimeError):
     """Raised for non-classified runtime failures during slot save."""
@@ -138,6 +155,24 @@ class OneShotBind:
     payload_bytes: bytes
     manifest: SlotManifest
     restore_epoch: str
+
+
+@dataclass
+class BindResult:
+    accepted: bool
+    evicted_handles: list[str]
+    rejected_reason: str | None
+
+
+@runtime_checkable
+class OneShotBindTableProtocol(Protocol):
+    def consume_sync(
+        self, model_id: str, request_handle: str, restore_epoch: str
+    ) -> OneShotBind | None: ...
+
+    def peek_sync(self, model_id: str, request_handle: str) -> OneShotBind | None: ...
+
+    async def drain(self) -> int: ...
 
 
 class OneShotBindTable:
@@ -203,7 +238,13 @@ class OneShotBindTable:
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
-    def _pop_key(self, key: tuple[str, str], *, reason: str | None = None) -> None:
+    def _pop_key(
+        self,
+        key: tuple[str, str],
+        *,
+        reason: str | None = None,
+        evicted_handles: list[str] | None = None,
+    ) -> None:
         bind = self._binds_by_key.pop(key, None)
         self._expiry_by_key.pop(key, None)
         if bind is None:
@@ -213,17 +254,23 @@ class OneShotBindTable:
         )
         if reason is not None:
             self._emit_eviction(bind, reason)
+        if evicted_handles is not None:
+            evicted_handles.append(bind.request_handle)
 
-    def _evict_oldest(self, *, reason: str) -> bool:
+    def _evict_oldest(
+        self, *, reason: str, evicted_handles: list[str] | None = None
+    ) -> bool:
         if not self._binds_by_key:
             return False
         oldest_key = next(iter(self._binds_by_key))
-        self._pop_key(oldest_key, reason=reason)
+        self._pop_key(oldest_key, reason=reason, evicted_handles=evicted_handles)
         return True
 
-    def _sweep_expired_front_locked(self, now: float) -> None:
+    def _sweep_expired_front_locked(
+        self, now: float, evicted_handles: list[str] | None = None
+    ) -> None:
         if self._entry_ttl_secs <= 0:
-            while self._evict_oldest(reason="ttl"):
+            while self._evict_oldest(reason="ttl", evicted_handles=evicted_handles):
                 pass
             return
         while self._binds_by_key:
@@ -231,31 +278,48 @@ class OneShotBindTable:
             expires_at = self._expiry_by_key.get(oldest_key)
             if expires_at is None or expires_at > now:
                 break
-            self._pop_key(oldest_key, reason="ttl")
+            self._pop_key(oldest_key, reason="ttl", evicted_handles=evicted_handles)
 
-    def bind(self, bind: OneShotBind) -> None:
+    def bind(self, bind: OneShotBind) -> BindResult:
         key = (bind.model_id, bind.request_handle)
         with self._guard:
+            payload_size = self._payload_size(bind)
+            if payload_size > self._max_total_bytes:
+                raise ValueError(
+                    "one-shot bind payload exceeds max_total_bytes policy"
+                )
+
             now = self._time_fn()
-            self._sweep_expired_front_locked(now)
+            evicted_handles: list[str] = []
+            self._sweep_expired_front_locked(now, evicted_handles=evicted_handles)
 
             if key in self._binds_by_key:
                 self._pop_key(key)
 
             self._binds_by_key[key] = bind
             self._expiry_by_key[key] = now + float(self._entry_ttl_secs)
-            self._total_payload_bytes += self._payload_size(bind)
+            self._total_payload_bytes += payload_size
 
             while len(self._binds_by_key) > self._max_entries:
-                if not self._evict_oldest(reason="lru"):
+                if not self._evict_oldest(reason="lru", evicted_handles=evicted_handles):
                     break
 
             while self._total_payload_bytes > self._max_total_bytes:
-                if not self._evict_oldest(reason="max_bytes"):
+                if not self._evict_oldest(
+                    reason="max_bytes", evicted_handles=evicted_handles
+                ):
                     break
 
-    async def put(self, bind: OneShotBind) -> None:
-        self.bind(bind)
+            accepted = key in self._binds_by_key
+            rejected_reason = None if accepted else "evicted_immediately"
+            return BindResult(
+                accepted=accepted,
+                evicted_handles=evicted_handles,
+                rejected_reason=rejected_reason,
+            )
+
+    async def put(self, bind: OneShotBind) -> BindResult:
+        return self.bind(bind)
 
     def consume_sync(
         self, model_id: str, request_handle: str, restore_epoch: str

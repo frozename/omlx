@@ -201,6 +201,20 @@ SLOT_API_VERSION = "0.1.0"
 SLOT_ALLOWED_ACTIONS = {"save", "restore"}
 
 
+class SlotResolveError(str, Enum):
+    UNKNOWN_MODEL = "unknown_model"
+    AMBIGUOUS_ALIAS = "ambiguous_alias"
+    DEFAULT_HANDLE_REJECTED = "default_handle_rejected"
+
+
+@dataclass
+class SlotResolveResult:
+    canonical_model_id: str
+    candidate_model_ids: list[str]
+    has_default_alias: bool
+    error: SlotResolveError | None = None
+
+
 # =============================================================================
 # Server State
 # =============================================================================
@@ -1441,9 +1455,62 @@ def _slot_apply_runtime_http_detail(
             "details": {
                 "exception_type": exc.__class__.__name__,
                 "message": message,
+                "reason": getattr(exc, "reason", "unknown"),
             },
         }
     }
+
+
+def resolve_slot_apply_model(request_model: str, request_handle: str) -> SlotResolveResult:
+    """Resolve candidate model IDs for one-shot bind lookup in a single place."""
+    handle = request_handle.strip() if isinstance(request_handle, str) else ""
+    if not handle:
+        return SlotResolveResult(
+            canonical_model_id=request_model or (_server_state.default_model or ""),
+            candidate_model_ids=[],
+            has_default_alias=False,
+            error=SlotResolveError.DEFAULT_HANDLE_REJECTED,
+        )
+
+    canonical_model_id = request_model
+    if canonical_model_id:
+        try:
+            canonical_model_id = resolve_model_id(canonical_model_id) or canonical_model_id
+        except Exception:
+            return SlotResolveResult(
+                canonical_model_id=request_model,
+                candidate_model_ids=[],
+                has_default_alias=False,
+                error=SlotResolveError.AMBIGUOUS_ALIAS,
+            )
+    if not canonical_model_id:
+        canonical_model_id = _server_state.default_model or ""
+    if not canonical_model_id:
+        return SlotResolveResult(
+            canonical_model_id="",
+            candidate_model_ids=[],
+            has_default_alias=False,
+            error=SlotResolveError.UNKNOWN_MODEL,
+        )
+
+    candidates: list[str] = [canonical_model_id]
+    base_name = os.path.basename(canonical_model_id.rstrip("/"))
+    if base_name and base_name not in candidates:
+        candidates.append(base_name)
+
+    default_model = _server_state.default_model
+    has_default_alias = False
+    if default_model:
+        has_default_alias = default_model != canonical_model_id
+        if default_model not in candidates:
+            candidates.append(default_model)
+
+    return SlotResolveResult(
+        canonical_model_id=canonical_model_id,
+        candidate_model_ids=candidates,
+        has_default_alias=has_default_alias,
+        error=None,
+    )
 
 
 async def _preflight_chat_slot_apply(
@@ -1471,17 +1538,17 @@ async def _preflight_chat_slot_apply(
             request_handle=request_handle,
         )
 
-    model_candidates: list[str] = []
-    if model_id:
-        model_candidates.append(model_id)
-        model_candidates.append(os.path.basename(model_id.rstrip("/")))
-    if _server_state.default_model:
-        model_candidates.append(_server_state.default_model)
+    resolution = resolve_slot_apply_model(model_id, request_handle)
+    if resolution.error is not None:
+        raise SlotApplyHandleNotFound(
+            model_id=resolution.canonical_model_id or model_id or (_server_state.default_model or ""),
+            request_handle=request_handle,
+        )
 
     bind: OneShotBind | None = None
-    bind_model_id = model_id
+    bind_model_id = resolution.canonical_model_id or model_id
     seen: set[str] = set()
-    for candidate in model_candidates:
+    for candidate in resolution.candidate_model_ids:
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
@@ -2319,7 +2386,16 @@ async def slot_action(
                 )
                 if _server_state.one_shot_bind_table is None:
                     _server_state.one_shot_bind_table = OneShotBindTable()
-                await _server_state.one_shot_bind_table.put(bind)
+                bind_result = await _server_state.one_shot_bind_table.put(bind)
+                if not bind_result.accepted:
+                    logger.warning(
+                        "[slot_restore_parked_rejected] model_id=%s request_handle=%s restore_epoch=%s rejected_reason=%s evicted_handles=%s",
+                        resolved_model,
+                        request_handle,
+                        restore_epoch,
+                        bind_result.rejected_reason,
+                        ",".join(bind_result.evicted_handles),
+                    )
         except SlotBusy as exc:
             raise HTTPException(
                 status_code=423,

@@ -25,10 +25,13 @@ from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
 from omlx.slot_store import (
     OneShotBind,
+    OneShotBindTableProtocol,
     OneShotBindTable,
     SlotApplyEpochMismatch,
     SlotApplyGuardMismatch,
     SlotApplyHandleNotFound,
+    SlotApplyRuntimeError,
+    SlotApplyRuntimeReason,
     SlotManifest,
     hash_prompt_token_prefix,
 )
@@ -717,6 +720,147 @@ class TestSchedulerOneShotBindApply:
             )
         finally:
             server_module._server_state.one_shot_bind_table = original_table
+
+    def test_slot_apply_resolution_matrix_matches_between_server_and_scheduler(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        alias_map = {
+            "alias-a": "model-a",
+            "provider/model-b": "model-b",
+            "model-c/": "model-c",
+        }
+        monkeypatch.setattr(
+            server_module,
+            "resolve_model_id",
+            lambda model_id: alias_map.get(model_id, model_id),
+        )
+
+        original_default = server_module._server_state.default_model
+        try:
+            cases = [
+                ("model-a", None),
+                ("alias-a", None),
+                ("provider/model-b", None),
+                ("model-c/", None),
+                ("model-a", "model-a"),
+                ("model-a", "default-model"),
+                ("unknown-model", "default-model"),
+                ("", "default-model"),
+            ]
+            for request_model, default_model in cases:
+                server_module._server_state.default_model = default_model
+                from_server = server_module.resolve_slot_apply_model(
+                    request_model=request_model,
+                    request_handle="handle-x",
+                )
+                from_scheduler = scheduler._resolve_slot_apply_model(
+                    request_model=request_model,
+                    request_handle="handle-x",
+                )
+                assert from_scheduler == from_server
+        finally:
+            server_module._server_state.default_model = original_default
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_runtime_reason_deserialize_failed(
+        self, mock_model, mock_tokenizer
+    ):
+        table = OneShotBindTable()
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            one_shot_bind_table_getter=lambda: table,
+            default_model_getter=lambda: "test-model",
+        )
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="handle-a",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(n_tokens=3),
+                restore_epoch="epoch-a",
+            )
+        )
+        request = Request(
+            request_id="req-runtime-deser",
+            prompt=[1, 2, 3, 4],
+            sampling_params=SamplingParams(max_tokens=8),
+            x_omlx_request_handle="handle-a",
+            x_omlx_restore_epoch="epoch-a",
+            x_omlx_model_id="test-model",
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        scheduler._deserialize_one_shot_bind_payload = lambda _payload: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("decode failed")
+        )
+        scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
+
+        with pytest.raises(SlotApplyRuntimeError) as exc:
+            scheduler.try_apply_one_shot_bind(request)
+        assert exc.value.reason == SlotApplyRuntimeReason.DESERIALIZE_FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_runtime_reason_engine_unavailable(
+        self, mock_model, mock_tokenizer
+    ):
+        table = OneShotBindTable()
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            one_shot_bind_table_getter=lambda: table,
+            default_model_getter=lambda: "test-model",
+        )
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="handle-a",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(n_tokens=3),
+                restore_epoch="epoch-a",
+            )
+        )
+        request = Request(
+            request_id="req-runtime-engine",
+            prompt=[1, 2, 3, 4],
+            sampling_params=SamplingParams(max_tokens=8),
+            x_omlx_request_handle="handle-a",
+            x_omlx_restore_epoch="epoch-a",
+            x_omlx_model_id="test-model",
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        scheduler._current_slot_restore_guards = lambda _model_id: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("engine unavailable")
+        )
+
+        with pytest.raises(SlotApplyRuntimeError) as exc:
+            scheduler.try_apply_one_shot_bind(request)
+        assert exc.value.reason == SlotApplyRuntimeReason.ENGINE_UNAVAILABLE.value
+
+    def test_one_shot_bind_table_protocol_runtime_checkable_with_fake(
+        self, mock_model, mock_tokenizer
+    ):
+        class _FakeBindTable:
+            def consume_sync(self, model_id: str, request_handle: str, restore_epoch: str):
+                return None
+
+            def peek_sync(self, model_id: str, request_handle: str):
+                return None
+
+            async def drain(self) -> int:
+                return 0
+
+        fake = _FakeBindTable()
+        assert isinstance(fake, OneShotBindTableProtocol)
+
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            one_shot_bind_table_getter=lambda: fake,
+        )
+        assert scheduler._get_one_shot_bind_table() is fake
 
 
 class TestSchedulerAbortRequest:

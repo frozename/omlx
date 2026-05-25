@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from omlx.slot_store import (
+    OneShotBindTableProtocol,
     InvalidFilename,
     OneShotBind,
     OneShotBindTable,
@@ -573,7 +574,7 @@ async def test_one_shot_bind_concurrent_consume_only_one_wins():
 async def test_one_shot_bind_evicts_lru_when_max_entries_reached():
     table = OneShotBindTable(max_entries=2, max_total_bytes=1024, entry_ttl_secs=600)
 
-    await table.put(
+    first_result = await table.put(
         OneShotBind(
             model_id="m",
             request_handle="h-1",
@@ -582,7 +583,7 @@ async def test_one_shot_bind_evicts_lru_when_max_entries_reached():
             restore_epoch="e-1",
         )
     )
-    await table.put(
+    second_result = await table.put(
         OneShotBind(
             model_id="m",
             request_handle="h-2",
@@ -591,7 +592,7 @@ async def test_one_shot_bind_evicts_lru_when_max_entries_reached():
             restore_epoch="e-2",
         )
     )
-    await table.put(
+    third_result = await table.put(
         OneShotBind(
             model_id="m",
             request_handle="h-3",
@@ -601,9 +602,54 @@ async def test_one_shot_bind_evicts_lru_when_max_entries_reached():
         )
     )
 
+    assert first_result.accepted is True
+    assert second_result.accepted is True
+    assert third_result.accepted is True
+    assert third_result.evicted_handles == ["h-1"]
     assert await table.peek_any("m", "h-1") is None
     assert await table.peek_any("m", "h-2") is not None
     assert await table.peek_any("m", "h-3") is not None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_put_returns_rejected_when_entry_immediately_evicted():
+    table = OneShotBindTable(max_entries=0, max_total_bytes=1024, entry_ttl_secs=600)
+
+    result = await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="h-1",
+            payload_bytes=b"1",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-1",
+        )
+    )
+
+    assert result.accepted is False
+    assert result.rejected_reason == "evicted_immediately"
+    assert result.evicted_handles == ["h-1"]
+    assert await table.peek_any("m", "h-1") is None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_put_raises_on_payload_over_policy_limit():
+    table = OneShotBindTable(max_entries=10, max_total_bytes=2, entry_ttl_secs=600)
+
+    with pytest.raises(ValueError, match="exceeds max_total_bytes"):
+        await table.put(
+            OneShotBind(
+                model_id="m",
+                request_handle="h-oversize",
+                payload_bytes=b"123",
+                manifest=_manifest(n_tokens=1),
+                restore_epoch="e-1",
+            )
+        )
+
+
+def test_one_shot_bind_table_runtime_protocol_is_checkable():
+    table = OneShotBindTable()
+    assert isinstance(table, OneShotBindTableProtocol)
 
 
 @pytest.mark.asyncio

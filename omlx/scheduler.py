@@ -48,8 +48,11 @@ from .slot_store import (
     SlotApplyEpochMismatch,
     SlotApplyGuardMismatch,
     SlotApplyHandleNotFound,
+    SlotApplyRuntimeReason,
     SlotApplyRuntimeError,
     SlotGuardMismatch,
+    SlotManifestInvalid,
+    OneShotBindTableProtocol,
     check_restore_guards,
     compute_model_fingerprint,
     hash_prompt_token_prefix,
@@ -670,7 +673,9 @@ class Scheduler:
         *,
         slot_lookup_fn: Callable[[str], Any] | None = None,
         slot_ctx_size_fn: Callable[[str], int] | None = None,
-        one_shot_bind_table_getter: Callable[[], Any] | None = None,
+        one_shot_bind_table_getter: (
+            Callable[[], OneShotBindTableProtocol | None] | None
+        ) = None,
         default_model_getter: Callable[[], str | None] | None = None,
     ):
         """
@@ -942,7 +947,9 @@ class Scheduler:
         *,
         slot_lookup_fn: Callable[[str], Any] | None = None,
         slot_ctx_size_fn: Callable[[str], int] | None = None,
-        one_shot_bind_table_getter: Callable[[], Any] | None = None,
+        one_shot_bind_table_getter: (
+            Callable[[], OneShotBindTableProtocol | None] | None
+        ) = None,
         default_model_getter: Callable[[], str | None] | None = None,
     ) -> None:
         """Inject slot-runtime lookups to avoid direct server imports."""
@@ -969,7 +976,7 @@ class Scheduler:
 
         return int(_slot_ctx_size_for_model(model_id))
 
-    def _get_one_shot_bind_table(self) -> Any:
+    def _get_one_shot_bind_table(self) -> OneShotBindTableProtocol | None:
         if self._one_shot_bind_table_getter is not None:
             return self._one_shot_bind_table_getter()
         from .server import _server_state
@@ -3322,6 +3329,23 @@ class Scheduler:
         ctx_size = self._get_slot_ctx_size(model_id)
         return fingerprint, int(ctx_size)
 
+    def _resolve_slot_apply_model(self, request_model: str, request_handle: str):
+        """Resolve canonical model and candidate ids for slot apply matching."""
+        from .server import resolve_slot_apply_model
+
+        return resolve_slot_apply_model(
+            request_model=request_model,
+            request_handle=request_handle,
+        )
+
+    @staticmethod
+    def _classify_slot_apply_runtime_reason(exc: Exception) -> str:
+        if isinstance(exc, SlotManifestInvalid):
+            return SlotApplyRuntimeReason.PAYLOAD_INVALID.value
+        if isinstance(exc, SlotGuardMismatch):
+            return SlotApplyRuntimeReason.GUARD_EVAL_FAILED.value
+        return SlotApplyRuntimeReason.UNKNOWN.value
+
     def _deserialize_one_shot_bind_payload(self, payload_bytes: bytes) -> list[Any]:
         """Deserialize one-shot payload bytes on the admission thread."""
         import tempfile
@@ -3354,33 +3378,32 @@ class Scheduler:
         if table is None:
             return False
         default_model = self._get_default_model() or ""
+        request_model = (
+            request.x_omlx_model_id or self.config.model_name or default_model
+        )
+        model_resolution = self._resolve_slot_apply_model(
+            request_model=request_model or "",
+            request_handle=request_handle,
+        )
+        model_candidates = list(model_resolution.candidate_model_ids)
+        if not model_candidates and request_model:
+            model_candidates = [request_model]
 
         try:
             if not request.x_omlx_restore_epoch:
                 logger.info(
                     "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
-                    request.x_omlx_model_id or default_model,
+                    model_resolution.canonical_model_id or request.x_omlx_model_id or default_model,
                     request_handle,
                     "<required>",
                     None,
                 )
                 raise SlotApplyEpochMismatch(
-                    model_id=request.x_omlx_model_id or default_model,
+                    model_id=model_resolution.canonical_model_id or request.x_omlx_model_id or default_model,
                     request_handle=request_handle,
                     expected_epoch="<required>",
                     observed_epoch=None,
                 )
-
-            model_candidates: list[str] = []
-            if request.x_omlx_model_id:
-                model_candidates.append(request.x_omlx_model_id)
-            if self.config.model_name:
-                model_candidates.append(self.config.model_name)
-                model_candidates.append(
-                    os.path.basename(self.config.model_name.rstrip("/"))
-                )
-            if default_model:
-                model_candidates.append(default_model)
 
             seen: set[str] = set()
             ordered_candidates: list[str] = []
@@ -3419,18 +3442,23 @@ class Scheduler:
 
                 logger.info(
                     "[slot_apply_miss_handle_not_found] model_id=%s request_handle=%s",
-                    request.x_omlx_model_id or default_model,
+                    model_resolution.canonical_model_id or request.x_omlx_model_id or default_model,
                     request_handle,
                 )
                 raise SlotApplyHandleNotFound(
-                    model_id=request.x_omlx_model_id or default_model,
+                    model_id=model_resolution.canonical_model_id or request.x_omlx_model_id or default_model,
                     request_handle=request_handle,
                 )
 
             try:
-                current_fingerprint, current_ctx_size = self._current_slot_restore_guards(
-                    bind.model_id
-                )
+                try:
+                    current_fingerprint, current_ctx_size = self._current_slot_restore_guards(
+                        bind.model_id
+                    )
+                except Exception as exc:
+                    raise SlotApplyRuntimeError(
+                        reason=SlotApplyRuntimeReason.ENGINE_UNAVAILABLE.value
+                    ) from exc
                 check_restore_guards(
                     manifest=bind.manifest,
                     current_fingerprint=current_fingerprint,
@@ -3489,7 +3517,12 @@ class Scheduler:
                     request_handle,
                 )
 
-            prompt_cache = self._deserialize_one_shot_bind_payload(bind.payload_bytes)
+            try:
+                prompt_cache = self._deserialize_one_shot_bind_payload(bind.payload_bytes)
+            except Exception as exc:
+                raise SlotApplyRuntimeError(
+                    reason=SlotApplyRuntimeReason.DESERIALIZE_FAILED.value
+                ) from exc
             request.prompt_cache = prompt_cache
             request.block_table = None
             request.shared_prefix_blocks = 0
@@ -3511,8 +3544,12 @@ class Scheduler:
             SlotApplyGuardMismatch,
         ):
             raise
+        except SlotApplyRuntimeError:
+            raise
         except Exception as exc:
-            raise SlotApplyRuntimeError("slot apply failed") from exc
+            raise SlotApplyRuntimeError(
+                reason=self._classify_slot_apply_runtime_reason(exc)
+            ) from exc
 
     def add_request(self, request: Request) -> None:
         """
