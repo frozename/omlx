@@ -570,6 +570,110 @@ async def test_one_shot_bind_concurrent_consume_only_one_wins():
 
 
 @pytest.mark.asyncio
+async def test_one_shot_bind_evicts_lru_when_max_entries_reached():
+    table = OneShotBindTable(max_entries=2, max_total_bytes=1024, entry_ttl_secs=600)
+
+    await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="h-1",
+            payload_bytes=b"1",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-1",
+        )
+    )
+    await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="h-2",
+            payload_bytes=b"2",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-2",
+        )
+    )
+    await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="h-3",
+            payload_bytes=b"3",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-3",
+        )
+    )
+
+    assert await table.peek_any("m", "h-1") is None
+    assert await table.peek_any("m", "h-2") is not None
+    assert await table.peek_any("m", "h-3") is not None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_evicts_on_max_bytes_and_logs_event(caplog):
+    table = OneShotBindTable(max_entries=10, max_total_bytes=5, entry_ttl_secs=600)
+
+    await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="h-1",
+            payload_bytes=b"1234",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-1",
+        )
+    )
+    with caplog.at_level("INFO"):
+        await table.put(
+            OneShotBind(
+                model_id="m",
+                request_handle="h-2",
+                payload_bytes=b"5678",
+                manifest=_manifest(n_tokens=1),
+                restore_epoch="e-2",
+            )
+        )
+
+    assert await table.peek_any("m", "h-1") is None
+    assert await table.peek_any("m", "h-2") is not None
+    assert any(
+        '"reason":"max_bytes"' in record.message
+        for record in caplog.records
+        if "one_shot_bind_table_evicted" in record.message
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_sweeps_ttl_on_next_bind():
+    now = {"value": 0.0}
+    table = OneShotBindTable(
+        max_entries=10,
+        max_total_bytes=1024,
+        entry_ttl_secs=1,
+        time_fn=lambda: now["value"],
+    )
+
+    await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="expired",
+            payload_bytes=b"abc",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-1",
+        )
+    )
+    now["value"] = 2.0
+    await table.put(
+        OneShotBind(
+            model_id="m",
+            request_handle="fresh",
+            payload_bytes=b"xyz",
+            manifest=_manifest(n_tokens=1),
+            restore_epoch="e-2",
+        )
+    )
+
+    assert await table.peek_any("m", "expired") is None
+    assert await table.peek_any("m", "fresh") is not None
+
+
+@pytest.mark.asyncio
 async def test_drain_clears_all_entries_returns_count():
     table = OneShotBindTable()
     for i in range(3):

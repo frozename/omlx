@@ -666,6 +666,11 @@ class Scheduler:
         model: Any,
         tokenizer: Any,
         config: SchedulerConfig | None = None,
+        *,
+        slot_lookup_fn: Callable[[str], Any] | None = None,
+        slot_ctx_size_fn: Callable[[str], int] | None = None,
+        one_shot_bind_table_getter: Callable[[], Any] | None = None,
+        default_model_getter: Callable[[], str | None] | None = None,
     ):
         """
         Initialize the scheduler.
@@ -684,6 +689,10 @@ class Scheduler:
         # Rust RefCell.  See: https://github.com/huggingface/tokenizers/issues/537
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
+        self._slot_lookup_fn = slot_lookup_fn
+        self._slot_ctx_size_fn = slot_ctx_size_fn
+        self._one_shot_bind_table_getter = one_shot_bind_table_getter
+        self._default_model_getter = default_model_getter
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
@@ -926,6 +935,52 @@ class Scheduler:
         # Must be after _is_harmony_model / _generation_config_eos init
         # since _get_xtc_special_tokens() delegates to _get_stop_tokens().
         self._xtc_special_tokens: list[int] = self._get_xtc_special_tokens()
+
+    def set_slot_runtime_dependencies(
+        self,
+        *,
+        slot_lookup_fn: Callable[[str], Any] | None = None,
+        slot_ctx_size_fn: Callable[[str], int] | None = None,
+        one_shot_bind_table_getter: Callable[[], Any] | None = None,
+        default_model_getter: Callable[[], str | None] | None = None,
+    ) -> None:
+        """Inject slot-runtime lookups to avoid direct server imports."""
+        if slot_lookup_fn is not None:
+            self._slot_lookup_fn = slot_lookup_fn
+        if slot_ctx_size_fn is not None:
+            self._slot_ctx_size_fn = slot_ctx_size_fn
+        if one_shot_bind_table_getter is not None:
+            self._one_shot_bind_table_getter = one_shot_bind_table_getter
+        if default_model_getter is not None:
+            self._default_model_getter = default_model_getter
+
+    def _get_slot_entry(self, model_id: str) -> Any:
+        if self._slot_lookup_fn is not None:
+            return self._slot_lookup_fn(model_id)
+        from .server import _slot_entry_for_model
+
+        return _slot_entry_for_model(model_id)
+
+    def _get_slot_ctx_size(self, model_id: str) -> int:
+        if self._slot_ctx_size_fn is not None:
+            return int(self._slot_ctx_size_fn(model_id))
+        from .server import _slot_ctx_size_for_model
+
+        return int(_slot_ctx_size_for_model(model_id))
+
+    def _get_one_shot_bind_table(self) -> Any:
+        if self._one_shot_bind_table_getter is not None:
+            return self._one_shot_bind_table_getter()
+        from .server import _server_state
+
+        return getattr(_server_state, "one_shot_bind_table", None)
+
+    def _get_default_model(self) -> str | None:
+        if self._default_model_getter is not None:
+            return self._default_model_getter()
+        from .server import _server_state
+
+        return _server_state.default_model
 
     @contextmanager
     def _phase_timer(self, phase: str):
@@ -3261,11 +3316,9 @@ class Scheduler:
 
     def _current_slot_restore_guards(self, model_id: str) -> tuple[str, int]:
         """Resolve current restore guards for admission-time revalidation."""
-        from .server import _slot_ctx_size_for_model, _slot_entry_for_model
-
-        entry = _slot_entry_for_model(model_id)
+        entry = self._get_slot_entry(model_id)
         fingerprint = compute_model_fingerprint(Path(entry.model_path))
-        ctx_size = _slot_ctx_size_for_model(model_id)
+        ctx_size = self._get_slot_ctx_size(model_id)
         return fingerprint, int(ctx_size)
 
     def _deserialize_one_shot_bind_payload(self, payload_bytes: bytes) -> list[Any]:
@@ -3296,22 +3349,21 @@ class Scheduler:
         if not request_handle:
             return False
 
-        from .server import _server_state
-
-        table = getattr(_server_state, "one_shot_bind_table", None)
+        table = self._get_one_shot_bind_table()
         if table is None:
             return False
+        default_model = self._get_default_model() or ""
 
         if not request.x_omlx_restore_epoch:
             logger.info(
                 "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
-                request.x_omlx_model_id or (_server_state.default_model or ""),
+                request.x_omlx_model_id or default_model,
                 request_handle,
                 "<required>",
                 None,
             )
             raise SlotApplyEpochMismatch(
-                model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
+                model_id=request.x_omlx_model_id or default_model,
                 request_handle=request_handle,
                 expected_epoch="<required>",
                 observed_epoch=None,
@@ -3323,8 +3375,8 @@ class Scheduler:
         if self.config.model_name:
             model_candidates.append(self.config.model_name)
             model_candidates.append(os.path.basename(self.config.model_name.rstrip("/")))
-        if _server_state.default_model:
-            model_candidates.append(_server_state.default_model)
+        if default_model:
+            model_candidates.append(default_model)
 
         seen: set[str] = set()
         ordered_candidates: list[str] = []
@@ -3366,11 +3418,11 @@ class Scheduler:
 
             logger.info(
                 "[slot_apply_miss_handle_not_found] model_id=%s request_handle=%s",
-                request.x_omlx_model_id or (_server_state.default_model or ""),
+                request.x_omlx_model_id or default_model,
                 request_handle,
             )
             raise SlotApplyHandleNotFound(
-                model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
+                model_id=request.x_omlx_model_id or default_model,
                 request_handle=request_handle,
             )
 

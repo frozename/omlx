@@ -303,40 +303,68 @@ def _get_slot_store() -> SlotStore:
 def _resolve_slot_request_handle_and_filename(
     slot_store: SlotStore, payload: dict[str, object], slot_id: int
 ) -> tuple[str, str]:
+    def _canonicalize_handle(raw_handle: str) -> str:
+        try:
+            handle = slot_store.validate_filename(raw_handle)
+        except InvalidFilename:
+            raise HTTPException(status_code=400, detail="invalid_request_handle")
+        if handle.endswith(".kvslot"):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "code": "invalid_request_handle",
+                        "message": "request_handle must not end with .kvslot",
+                    }
+                },
+            )
+        return handle
+
+    def _canonical_handle_from_filename(raw_filename: str) -> str:
+        try:
+            filename = slot_store.validate_filename(raw_filename)
+        except InvalidFilename as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not filename.endswith(".kvslot"):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "code": "invalid_slot_filename",
+                        "message": "filename must end with .kvslot",
+                    }
+                },
+            )
+        return _canonicalize_handle(filename.removesuffix(".kvslot"))
+
     raw_filename = payload.get("filename")
     raw_request_handle = payload.get("request_handle")
 
-    filename: str | None = None
+    filename_handle: str | None = None
     request_handle: str | None = None
 
     if raw_filename is not None:
         if not isinstance(raw_filename, str):
             raise HTTPException(status_code=400, detail="Invalid filename")
-        try:
-            filename = slot_store.validate_filename(raw_filename)
-        except InvalidFilename as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        filename_handle = _canonical_handle_from_filename(raw_filename)
 
     if raw_request_handle is not None:
         if not isinstance(raw_request_handle, str):
             raise HTTPException(status_code=400, detail="invalid_request_handle")
-        try:
-            request_handle = slot_store.validate_filename(raw_request_handle)
-        except InvalidFilename:
-            raise HTTPException(status_code=400, detail="invalid_request_handle")
+        request_handle = _canonicalize_handle(raw_request_handle)
 
-    if filename is not None and request_handle is not None:
-        if filename.removesuffix(".kvslot") != request_handle:
+    if filename_handle is not None and request_handle is not None:
+        if filename_handle != request_handle:
             raise HTTPException(
                 status_code=400, detail="inconsistent_handle_filename"
             )
-        return request_handle, filename
+        return request_handle, f"{request_handle}.kvslot"
 
     if request_handle is not None:
         return request_handle, f"{request_handle}.kvslot"
 
-    if filename is not None:
-        return filename.removesuffix(".kvslot"), filename
+    if filename_handle is not None:
+        return filename_handle, f"{filename_handle}.kvslot"
 
     if slot_id == 0:
         raise HTTPException(
@@ -1683,6 +1711,10 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
+        slot_lookup_fn=_slot_entry_for_model,
+        slot_ctx_size_fn=_slot_ctx_size_for_model,
+        one_shot_bind_table_getter=lambda: getattr(_server_state, "one_shot_bind_table", None),
+        default_model_getter=lambda: _server_state.default_model,
     )
 
     # Discover models (use pinned models from settings file)

@@ -6,15 +6,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import struct
+import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 
 class SlotState(Enum):
@@ -129,14 +132,119 @@ class OneShotBind:
 
 
 class OneShotBindTable:
-    def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], OneShotBind] = {}
-        self._guard = asyncio.Lock()
+    _DEFAULT_MAX_ENTRIES = 1024
+    _DEFAULT_MAX_TOTAL_BYTES = 1 << 30  # 1 GiB
+    _DEFAULT_TTL_SECS = 600
 
-    async def put(self, bind: OneShotBind) -> None:
+    def __init__(
+        self,
+        *,
+        max_entries: int | None = None,
+        max_total_bytes: int | None = None,
+        entry_ttl_secs: int | None = None,
+        time_fn: Callable[[], float] | None = None,
+    ) -> None:
+        self._max_entries = (
+            int(max_entries)
+            if max_entries is not None
+            else self._env_int("OMLX_ONE_SHOT_MAX_ENTRIES", self._DEFAULT_MAX_ENTRIES)
+        )
+        self._max_total_bytes = (
+            int(max_total_bytes)
+            if max_total_bytes is not None
+            else self._env_int("OMLX_ONE_SHOT_MAX_BYTES", self._DEFAULT_MAX_TOTAL_BYTES)
+        )
+        self._entry_ttl_secs = (
+            int(entry_ttl_secs)
+            if entry_ttl_secs is not None
+            else self._env_int("OMLX_ONE_SHOT_TTL_SECS", self._DEFAULT_TTL_SECS)
+        )
+
+        self._entries: OrderedDict[tuple[str, str], OneShotBind] = OrderedDict()
+        self._expires_at: dict[tuple[str, str], float] = {}
+        self._total_bytes = 0
+        self._time_fn = time_fn or time.monotonic
+        self._guard = asyncio.Lock()
+        self._logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        return parsed if parsed >= 0 else default
+
+    @staticmethod
+    def _payload_size(bind: OneShotBind) -> int:
+        return len(bind.payload_bytes)
+
+    def _emit_eviction(self, bind: OneShotBind, reason: str) -> None:
+        payload = {
+            "handle": bind.request_handle,
+            "reason": reason,
+            "remaining_entries": len(self._entries),
+            "remaining_bytes": self._total_bytes,
+        }
+        self._logger.info(
+            "one_shot_bind_table_evicted %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _pop_key(self, key: tuple[str, str], *, reason: str | None = None) -> None:
+        bind = self._entries.pop(key, None)
+        self._expires_at.pop(key, None)
+        if bind is None:
+            return
+        self._total_bytes = max(0, self._total_bytes - self._payload_size(bind))
+        if reason is not None:
+            self._emit_eviction(bind, reason)
+
+    def _evict_oldest(self, *, reason: str) -> bool:
+        if not self._entries:
+            return False
+        oldest_key = next(iter(self._entries))
+        self._pop_key(oldest_key, reason=reason)
+        return True
+
+    def _sweep_expired_front_locked(self, now: float) -> None:
+        if self._entry_ttl_secs <= 0:
+            while self._evict_oldest(reason="ttl"):
+                pass
+            return
+        while self._entries:
+            oldest_key = next(iter(self._entries))
+            expires_at = self._expires_at.get(oldest_key)
+            if expires_at is None or expires_at > now:
+                break
+            self._pop_key(oldest_key, reason="ttl")
+
+    async def bind(self, bind: OneShotBind) -> None:
         key = (bind.model_id, bind.request_handle)
         async with self._guard:
+            now = self._time_fn()
+            self._sweep_expired_front_locked(now)
+
+            if key in self._entries:
+                self._pop_key(key)
+
             self._entries[key] = bind
+            self._expires_at[key] = now + float(self._entry_ttl_secs)
+            self._total_bytes += self._payload_size(bind)
+
+            while len(self._entries) > self._max_entries:
+                if not self._evict_oldest(reason="lru"):
+                    break
+
+            while self._total_bytes > self._max_total_bytes:
+                if not self._evict_oldest(reason="max_bytes"):
+                    break
+
+    async def put(self, bind: OneShotBind) -> None:
+        await self.bind(bind)
 
     async def consume(
         self, model_id: str, request_handle: str, restore_epoch: str
@@ -149,13 +257,21 @@ class OneShotBindTable:
                 return None
             if bind.restore_epoch != restore_epoch:
                 return None
-            return self._entries.pop(key, None)
+            self._expires_at.pop(key, None)
+            removed = self._entries.pop(key, None)
+            if removed is not None:
+                self._total_bytes = max(0, self._total_bytes - self._payload_size(removed))
+            return removed
 
     async def consume_any(self, model_id: str, request_handle: str) -> OneShotBind | None:
         """Deprecated: consumes by key without epoch validation."""
         key = (model_id, request_handle)
         async with self._guard:
-            return self._entries.pop(key, None)
+            self._expires_at.pop(key, None)
+            removed = self._entries.pop(key, None)
+            if removed is not None:
+                self._total_bytes = max(0, self._total_bytes - self._payload_size(removed))
+            return removed
 
     async def peek_any(self, model_id: str, request_handle: str) -> OneShotBind | None:
         """Return entry by key without removing it."""
@@ -165,14 +281,13 @@ class OneShotBindTable:
 
     async def drain(self) -> int:
         """Clear all entries; log each as slot_apply_drain_on_disable. Returns count."""
-        import logging
-
-        logger = logging.getLogger(__name__)
         async with self._guard:
             entries = list(self._entries.values())
             self._entries.clear()
+            self._expires_at.clear()
+            self._total_bytes = 0
         for bind in entries:
-            logger.info(
+            self._logger.info(
                 "[slot_apply_drain_on_disable] model_id=%s request_handle=%s restore_epoch=%s",
                 bind.model_id,
                 bind.request_handle,

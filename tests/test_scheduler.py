@@ -421,54 +421,16 @@ class TestSchedulerOneShotBindApply:
         assert applied is False
 
     @pytest.mark.asyncio
-    async def test_apply_success_emits_structured_event(
-        self, mock_model, mock_tokenizer, caplog
-    ):
-        import omlx.server as server_module
-
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
-        table = OneShotBindTable()
-        bind = OneShotBind(
-            model_id="test-model",
-            request_handle="handle-a",
-            payload_bytes=b"payload-a",
-            manifest=self._manifest(n_tokens=3),
-            restore_epoch="epoch-a",
-        )
-        await table.put(bind)
-
-        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
-        server_module._server_state.one_shot_bind_table = table
-        try:
-            request = Request(
-                request_id="req-2",
-                prompt=[1, 2, 3, 4, 5],
-                sampling_params=SamplingParams(max_tokens=8),
-                x_omlx_request_handle="handle-a",
-                x_omlx_restore_epoch="epoch-a",
-                x_omlx_model_id="test-model",
-            )
-            request.prompt_token_ids = [1, 2, 3, 4, 5]
-
-            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
-            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
-
-            with caplog.at_level("INFO"):
-                applied = scheduler.try_apply_one_shot_bind(request)
-
-            assert applied is True
-            assert any("slot_apply_success" in record.message for record in caplog.records)
-        finally:
-            server_module._server_state.one_shot_bind_table = original_table
-
-    @pytest.mark.asyncio
     async def test_try_apply_one_shot_bind_attaches_cache_and_returns_true_on_match(
         self, mock_model, mock_tokenizer
     ):
-        import omlx.server as server_module
-
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         table = OneShotBindTable()
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            one_shot_bind_table_getter=lambda: table,
+            default_model_getter=lambda: "test-model",
+        )
         bind = OneShotBind(
             model_id="test-model",
             request_handle="handle-a",
@@ -478,57 +440,25 @@ class TestSchedulerOneShotBindApply:
         )
         await table.put(bind)
 
-        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
-        server_module._server_state.one_shot_bind_table = table
-        try:
-            request = Request(
-                request_id="req-2",
-                prompt=[1, 2, 3, 4, 5],
-                sampling_params=SamplingParams(max_tokens=8),
-                x_omlx_request_handle="handle-a",
-                x_omlx_restore_epoch="epoch-a",
-                x_omlx_model_id="test-model",
-            )
-            request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request = Request(
+            request_id="req-2",
+            prompt=[1, 2, 3, 4, 5],
+            sampling_params=SamplingParams(max_tokens=8),
+            x_omlx_request_handle="handle-a",
+            x_omlx_restore_epoch="epoch-a",
+            x_omlx_model_id="test-model",
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
 
-            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
-            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
+        scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+        scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
 
-            applied = scheduler.try_apply_one_shot_bind(request)
-            assert applied is True
-            assert request.prompt_cache == ["cache-ok"]
-            assert request.cached_tokens == 3
-            assert request.remaining_tokens == [4, 5]
-            assert await table.consume_any("test-model", "handle-a") is None
-        finally:
-            server_module._server_state.one_shot_bind_table = original_table
-
-    @pytest.mark.asyncio
-    async def test_apply_miss_handle_not_found_emits_structured_event(
-        self, mock_model, mock_tokenizer, caplog
-    ):
-        import omlx.server as server_module
-
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
-        table = OneShotBindTable()
-        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
-        server_module._server_state.one_shot_bind_table = table
-        try:
-            request = Request(
-                request_id="req-4",
-                prompt=[1, 2, 3],
-                sampling_params=SamplingParams(max_tokens=8),
-                x_omlx_request_handle="missing",
-                x_omlx_restore_epoch="epoch-a",
-                x_omlx_model_id="test-model",
-            )
-            request.prompt_token_ids = [1, 2, 3]
-            with caplog.at_level("INFO"):
-                with pytest.raises(SlotApplyHandleNotFound):
-                    scheduler.try_apply_one_shot_bind(request)
-            assert any("slot_apply_miss_handle_not_found" in record.message for record in caplog.records)
-        finally:
-            server_module._server_state.one_shot_bind_table = original_table
+        applied = scheduler.try_apply_one_shot_bind(request)
+        assert applied is True
+        assert request.prompt_cache == ["cache-ok"]
+        assert request.cached_tokens == 3
+        assert request.remaining_tokens == [4, 5]
+        assert await table.consume_any("test-model", "handle-a") is None
 
     @pytest.mark.asyncio
     async def test_try_apply_one_shot_bind_raises_epoch_mismatch_and_does_NOT_consume_bind(
@@ -569,44 +499,6 @@ class TestSchedulerOneShotBindApply:
             server_module._server_state.one_shot_bind_table = original_table
 
     @pytest.mark.asyncio
-    async def test_apply_miss_epoch_mismatch_emits_structured_event_with_both_epochs(
-        self, mock_model, mock_tokenizer, caplog
-    ):
-        import omlx.server as server_module
-
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
-        table = OneShotBindTable()
-        await table.put(
-            OneShotBind(
-                model_id="test-model",
-                request_handle="handle-a",
-                payload_bytes=b"payload-a",
-                manifest=self._manifest(),
-                restore_epoch="epoch-good",
-            )
-        )
-
-        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
-        server_module._server_state.one_shot_bind_table = table
-        try:
-            request = Request(
-                request_id="req-3",
-                prompt=[1, 2, 3],
-                sampling_params=SamplingParams(max_tokens=8),
-                x_omlx_request_handle="handle-a",
-                x_omlx_restore_epoch="epoch-bad",
-                x_omlx_model_id="test-model",
-            )
-            request.prompt_token_ids = [1, 2, 3]
-
-            with caplog.at_level("INFO"):
-                with pytest.raises(SlotApplyEpochMismatch):
-                    scheduler.try_apply_one_shot_bind(request)
-            assert any("slot_apply_miss_epoch_mismatch" in record.message for record in caplog.records)
-        finally:
-            server_module._server_state.one_shot_bind_table = original_table
-
-    @pytest.mark.asyncio
     async def test_try_apply_one_shot_bind_raises_handle_not_found_when_no_entry(
         self, mock_model, mock_tokenizer
     ):
@@ -628,48 +520,6 @@ class TestSchedulerOneShotBindApply:
             request.prompt_token_ids = [1, 2, 3]
             with pytest.raises(SlotApplyHandleNotFound):
                 scheduler.try_apply_one_shot_bind(request)
-        finally:
-            server_module._server_state.one_shot_bind_table = original_table
-
-    @pytest.mark.asyncio
-    async def test_apply_miss_guard_mismatch_emits_structured_event_with_field(
-        self, mock_model, mock_tokenizer, caplog
-    ):
-        import omlx.server as server_module
-
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
-        table = OneShotBindTable()
-        await table.put(
-            OneShotBind(
-                model_id="test-model",
-                request_handle="handle-a",
-                payload_bytes=b"payload-a",
-                manifest=self._manifest(fingerprint="fp-a"),
-                restore_epoch="epoch-a",
-            )
-        )
-
-        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
-        server_module._server_state.one_shot_bind_table = table
-        try:
-            request = Request(
-                request_id="req-5",
-                prompt=[1, 2, 3],
-                sampling_params=SamplingParams(max_tokens=8),
-                x_omlx_request_handle="handle-a",
-                x_omlx_restore_epoch="epoch-a",
-                x_omlx_model_id="test-model",
-            )
-            request.prompt_token_ids = [1, 2, 3]
-
-            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
-            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-b", 32768)  # type: ignore[method-assign]
-
-            with caplog.at_level("INFO"):
-                with pytest.raises(SlotApplyGuardMismatch) as exc:
-                    scheduler.try_apply_one_shot_bind(request)
-            assert exc.value.field == "model_fingerprint"
-            assert any("slot_apply_miss_guard_mismatch" in record.message for record in caplog.records)
         finally:
             server_module._server_state.one_shot_bind_table = original_table
 

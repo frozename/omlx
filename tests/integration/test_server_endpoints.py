@@ -1081,6 +1081,38 @@ class TestSlotSaveEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
 
+    def test_v2_phase1a_save_rejects_request_handle_with_kvslot_suffix(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "abc.kvslot"},
+            )
+            assert response.status_code == 400
+            detail = response.json()["detail"]["error"]
+            assert detail["code"] == "invalid_request_handle"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
     def test_v2_phase1a_save_rejects_inconsistent_handle_filename(
         self, tmp_path, mock_engine_pool, monkeypatch
     ):
@@ -1167,6 +1199,38 @@ class TestSlotSaveEndpoint:
             body = response.json()
             assert body["request_handle"] == "x"
             assert body["filename"] == "x.kvslot"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_5a_save_rejects_filename_without_kvslot_suffix(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "x.safetensors", "model": "test-model"},
+            )
+            assert response.status_code == 400
+            detail = response.json()["detail"]["error"]
+            assert detail["code"] == "invalid_slot_filename"
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
@@ -1777,21 +1841,23 @@ class TestSlotRestoreEndpoint:
             client = TestClient(app)
             save_response = client.post(
                 "/slots/0?action=save",
-                json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                json={"filename": "slot-roundtrip.kvslot", "model": "test-model"},
             )
             assert save_response.status_code == 200, save_response.text
             n_saved = save_response.json()["n_saved"]
 
             restore_response = client.post(
                 "/slots/0?action=restore",
-                json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                json={"filename": "slot-roundtrip.kvslot", "model": "test-model"},
             )
             assert restore_response.status_code == 200
             assert restore_response.json()["n_restored"] == n_saved
 
-            saved_path = slot_dir / "slot-roundtrip.safetensors"
+            saved_path = slot_dir / "slot-roundtrip.kvslot"
+            safetensors_path = slot_dir / "slot-roundtrip.safetensors"
+            safetensors_path.write_bytes(saved_path.read_bytes())
             loaded_cache, file_metadata = load_prompt_cache(
-                str(saved_path),
+                str(safetensors_path),
                 return_metadata=True,
             )
             assert len(loaded_cache) == 2
@@ -1836,13 +1902,13 @@ class TestSlotRestoreEndpoint:
             client = TestClient(app)
             save_response = client.post(
                 "/slots/0?action=save",
-                json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                json={"filename": "slot-roundtrip.kvslot", "model": "test-model"},
             )
             assert save_response.status_code == 200, save_response.text
             with caplog.at_level("INFO"):
                 response = client.post(
                     "/slots/0?action=restore",
-                    json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                    json={"filename": "slot-roundtrip.kvslot", "model": "test-model"},
                 )
             assert response.status_code == 200, response.text
             assert any("slot_restore_parked" in record.message for record in caplog.records)
@@ -1885,7 +1951,7 @@ class TestSlotRestoreEndpoint:
             with caplog.at_level("INFO"):
                 response = client.post(
                     "/slots/0?action=save",
-                    json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                    json={"filename": "slot-roundtrip.kvslot", "model": "test-model"},
                 )
             assert response.status_code == 200, response.text
             assert any("slot_save_completed" in record.message for record in caplog.records)

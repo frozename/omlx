@@ -17,6 +17,7 @@ import asyncio
 import gc
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -83,6 +84,11 @@ class EnginePool:
         self,
         max_model_memory: int | None,
         scheduler_config: SchedulerConfig | None = None,
+        *,
+        slot_lookup_fn: Callable[[str], object] | None = None,
+        slot_ctx_size_fn: Callable[[str], int] | None = None,
+        one_shot_bind_table_getter: Callable[[], object | None] | None = None,
+        default_model_getter: Callable[[], str | None] | None = None,
     ):
         """
         Initialize the engine pool.
@@ -102,6 +108,27 @@ class EnginePool:
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
+        self._slot_lookup_fn = slot_lookup_fn
+        self._slot_ctx_size_fn = slot_ctx_size_fn
+        self._one_shot_bind_table_getter = one_shot_bind_table_getter
+        self._default_model_getter = default_model_getter
+
+    def _wire_scheduler_slot_runtime(self, engine: object) -> None:
+        """Inject slot-runtime dependencies into scheduler-backed engines."""
+        async_engine = getattr(engine, "_engine", None)
+        core = getattr(async_engine, "engine", None)
+        scheduler = getattr(core, "scheduler", None)
+        if scheduler is None:
+            return
+        setter = getattr(scheduler, "set_slot_runtime_dependencies", None)
+        if not callable(setter):
+            return
+        setter(
+            slot_lookup_fn=self._slot_lookup_fn,
+            slot_ctx_size_fn=self._slot_ctx_size_fn,
+            one_shot_bind_table_getter=self._one_shot_bind_table_getter,
+            default_model_getter=self._default_model_getter,
+        )
 
     @property
     def max_model_memory(self) -> int | None:
@@ -851,6 +878,7 @@ class EnginePool:
                     f"process memory limit exceeded"
                 )
 
+            self._wire_scheduler_slot_runtime(engine)
             entry.engine = engine
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
