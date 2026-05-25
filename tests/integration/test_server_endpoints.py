@@ -2311,7 +2311,7 @@ class TestSlotRestoreEndpoint:
                         "x_omlx_restore_epoch": "epoch-bad",
                     },
                 )
-            assert bad_response.status_code == 409, bad_response.text
+            assert bad_response.status_code == 500, bad_response.text
             payload = bad_response.json()
             detail = None
             if isinstance(payload.get("detail"), dict):

@@ -3169,8 +3169,6 @@ async def create_chat_completion(
         ) as exc:
             raise HTTPException(status_code=409, detail=_slot_apply_http_detail(exc))
         except SlotApplyRuntimeError as exc:
-            if request.x_omlx_request_handle is None:
-                raise
             correlation_id = (
                 getattr(http_request.state, "request_id", None)
                 or http_request.headers.get("x-request-id")
@@ -3181,7 +3179,7 @@ async def create_chat_completion(
                 )
             )
             raise HTTPException(
-                status_code=409,
+                status_code=500,
                 detail=_slot_apply_runtime_http_detail(
                     exc,
                     correlation_id=correlation_id,
