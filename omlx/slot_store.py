@@ -51,6 +51,60 @@ class SlotGuardMismatch(RuntimeError):
         self.observed = observed
 
 
+class SlotApplyEpochMismatch(RuntimeError):
+    """Raised when a one-shot bind epoch token is missing or mismatched."""
+
+    def __init__(
+        self,
+        model_id: str,
+        request_handle: str,
+        expected_epoch: str,
+        observed_epoch: str | None,
+    ) -> None:
+        message = (
+            "slot apply epoch mismatch: "
+            f"model={model_id} request_handle={request_handle} "
+            f"expected={expected_epoch} observed={observed_epoch}"
+        )
+        super().__init__(message)
+        self.model_id = model_id
+        self.request_handle = request_handle
+        self.expected_epoch = expected_epoch
+        self.observed_epoch = observed_epoch
+
+
+class SlotApplyHandleNotFound(RuntimeError):
+    """Raised when no one-shot bind exists for (model_id, request_handle)."""
+
+    def __init__(self, model_id: str, request_handle: str) -> None:
+        super().__init__(
+            f"slot handle not found: model={model_id} request_handle={request_handle}"
+        )
+        self.model_id = model_id
+        self.request_handle = request_handle
+
+
+class SlotApplyGuardMismatch(RuntimeError):
+    """Raised when one-shot admission guard checks fail."""
+
+    def __init__(
+        self,
+        field: str,
+        expected: str,
+        observed: str,
+        model_id: str,
+        request_handle: str,
+    ) -> None:
+        super().__init__(
+            f"slot apply guard mismatch for {field}: expected={expected} observed={observed}"
+        )
+        self.field = field
+        self.expected = expected
+        self.observed = observed
+        self.model_id = model_id
+        self.request_handle = request_handle
+
+
 @dataclass
 class SlotManifest:
     slot_format_version: int
@@ -61,6 +115,43 @@ class SlotManifest:
     tensors: list[dict[str, Any]]
     cache_class: str
     producer: dict[str, str]
+
+
+@dataclass
+class OneShotBind:
+    model_id: str
+    request_handle: str
+    payload_bytes: bytes
+    manifest: SlotManifest
+    restore_epoch: str
+
+
+class OneShotBindTable:
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], OneShotBind] = {}
+        self._guard = asyncio.Lock()
+
+    async def put(self, bind: OneShotBind) -> None:
+        key = (bind.model_id, bind.request_handle)
+        async with self._guard:
+            self._entries[key] = bind
+
+    async def consume(
+        self, model_id: str, request_handle: str, restore_epoch: str
+    ) -> OneShotBind | None:
+        key = (model_id, request_handle)
+        async with self._guard:
+            bind = self._entries.pop(key, None)
+            if bind is None:
+                return None
+            if bind.restore_epoch != restore_epoch:
+                return None
+            return bind
+
+    async def consume_any(self, model_id: str, request_handle: str) -> OneShotBind | None:
+        key = (model_id, request_handle)
+        async with self._guard:
+            return self._entries.pop(key, None)
 
 
 def _cheap_file_hash(path: Path, chunk_size: int = 1024 * 1024) -> str:

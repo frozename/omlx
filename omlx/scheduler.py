@@ -34,7 +34,7 @@ from mlx_lm.generate import (
     SequenceStateMachine,
     generation_stream,
 )
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import load_prompt_cache, make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors
 
 from .cache.observability import CacheRateTracker
@@ -43,6 +43,14 @@ from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .slot_store import (
+    SlotApplyEpochMismatch,
+    SlotApplyGuardMismatch,
+    SlotApplyHandleNotFound,
+    SlotGuardMismatch,
+    check_restore_guards,
+    compute_model_fingerprint,
+)
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
@@ -3249,6 +3257,119 @@ class Scheduler:
 
         return extracted, model_cache_config
 
+    def _current_slot_restore_guards(self, model_id: str) -> tuple[str, int]:
+        """Resolve current restore guards for admission-time revalidation."""
+        from .server import _slot_ctx_size_for_model, _slot_entry_for_model
+
+        entry = _slot_entry_for_model(model_id)
+        fingerprint = compute_model_fingerprint(Path(entry.model_path))
+        ctx_size = _slot_ctx_size_for_model(model_id)
+        return fingerprint, int(ctx_size)
+
+    def _deserialize_one_shot_bind_payload(self, payload_bytes: bytes) -> list[Any]:
+        """Deserialize one-shot payload bytes on the admission thread."""
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+            tmp.write(payload_bytes)
+            tmp_path = tmp.name
+        try:
+            with mx.stream(mx.default_device()):
+                result = load_prompt_cache(tmp_path, return_metadata=True)
+            cache = result[0] if isinstance(result, tuple) and len(result) == 2 else result
+            if isinstance(cache, list):
+                return cache
+            if isinstance(cache, tuple):
+                return list(cache)
+            return [cache]
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    async def try_apply_one_shot_bind(self, request: Request) -> bool:
+        """Attempt one-shot bind apply and consume if request is tagged."""
+        request_handle = request.x_omlx_request_handle
+        if not request_handle:
+            return False
+
+        from .server import _server_state
+
+        table = getattr(_server_state, "one_shot_bind_table", None)
+        if table is None:
+            return False
+
+        if not request.x_omlx_restore_epoch:
+            raise SlotApplyEpochMismatch(
+                model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
+                request_handle=request_handle,
+                expected_epoch="<required>",
+                observed_epoch=None,
+            )
+
+        model_candidates: list[str] = []
+        if request.x_omlx_model_id:
+            model_candidates.append(request.x_omlx_model_id)
+        if self.config.model_name:
+            model_candidates.append(self.config.model_name)
+            model_candidates.append(os.path.basename(self.config.model_name.rstrip("/")))
+        if _server_state.default_model:
+            model_candidates.append(_server_state.default_model)
+
+        seen: set[str] = set()
+        bind = None
+        model_id = ""
+        for candidate in model_candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            bind = await table.consume_any(candidate, request_handle)
+            if bind is not None:
+                model_id = candidate
+                break
+
+        if bind is None:
+            raise SlotApplyHandleNotFound(
+                model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
+                request_handle=request_handle,
+            )
+        if request.x_omlx_restore_epoch != bind.restore_epoch:
+            raise SlotApplyEpochMismatch(
+                model_id=model_id or bind.model_id,
+                request_handle=request_handle,
+                expected_epoch=bind.restore_epoch,
+                observed_epoch=request.x_omlx_restore_epoch,
+            )
+
+        try:
+            current_fingerprint, current_ctx_size = self._current_slot_restore_guards(
+                bind.model_id
+            )
+            check_restore_guards(
+                manifest=bind.manifest,
+                current_fingerprint=current_fingerprint,
+                current_ctx_size=current_ctx_size,
+            )
+        except SlotGuardMismatch as exc:
+            raise SlotApplyGuardMismatch(
+                field=exc.field,
+                expected=exc.expected,
+                observed=exc.observed,
+                model_id=bind.model_id,
+                request_handle=request_handle,
+            ) from exc
+
+        prompt_cache = self._deserialize_one_shot_bind_payload(bind.payload_bytes)
+        request.prompt_cache = prompt_cache
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request.cached_tokens = max(0, int(bind.manifest.n_tokens))
+        capped = min(request.cached_tokens, len(request.prompt_token_ids or []))
+        request.cached_tokens = capped
+        request.remaining_tokens = (request.prompt_token_ids or [])[capped:]
+        return True
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
@@ -3282,8 +3403,18 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        one_shot_applied = False
+        if request.x_omlx_request_handle is not None:
+            loop = asyncio.new_event_loop()
+            try:
+                one_shot_applied = loop.run_until_complete(
+                    self.try_apply_one_shot_bind(request)
+                )
+            finally:
+                loop.close()
+
         # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
+        if self.block_aware_cache is not None and not one_shot_applied:
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
@@ -3385,7 +3516,7 @@ class Scheduler:
                     )
             else:
                 request.remaining_tokens = request.prompt_token_ids
-        else:
+        elif not one_shot_applied:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
 

@@ -172,6 +172,11 @@ from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
 from .slot_store import (
     InvalidFilename,
+    OneShotBind,
+    OneShotBindTable,
+    SlotApplyEpochMismatch,
+    SlotApplyGuardMismatch,
+    SlotApplyHandleNotFound,
     SlotBusy,
     SlotGuardMismatch,
     SlotManifest,
@@ -243,7 +248,7 @@ class ServerState:
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
     slot_store: Optional[SlotStore] = None
-    _slot_v2a_last_loaded: Optional[dict[str, Any]] = None
+    one_shot_bind_table: Optional[OneShotBindTable] = None
 
 
 # Global server state instance
@@ -290,6 +295,8 @@ def _get_slot_store() -> SlotStore:
         or _server_state.slot_store._slot_save_path != slot_path  # noqa: SLF001
     ):
         _server_state.slot_store = SlotStore(slot_path)
+    if _server_state.one_shot_bind_table is None:
+        _server_state.one_shot_bind_table = OneShotBindTable()
     return _server_state.slot_store
 
 
@@ -1232,6 +1239,7 @@ def _apply_slot_restore_payload(
     entry: Any, payload_bytes: bytes, manifest: SlotManifest
 ) -> int:
     """Apply restore payload using available runtime hooks."""
+    del entry
     import mlx.core as mx
     from mlx_lm.models.cache import load_prompt_cache
     import tempfile
@@ -1243,14 +1251,9 @@ def _apply_slot_restore_payload(
         with mx.stream(mx.default_device()):
             result = load_prompt_cache(tmp_path, return_metadata=True)
         if isinstance(result, tuple) and len(result) == 2:
-            cache, file_metadata = result
+            _, file_metadata = result
         else:
-            cache, file_metadata = result, {}
-        _server_state._slot_v2a_last_loaded = {
-            "cache": cache,
-            "file_metadata": file_metadata,
-            "manifest": manifest,
-        }
+            file_metadata = {}
     finally:
         try:
             os.unlink(tmp_path)
@@ -1264,6 +1267,46 @@ def _apply_slot_restore_payload(
         if isinstance(cached_raw, str) and cached_raw.isdigit():
             return int(cached_raw)
     return int(manifest.n_tokens)
+
+
+def _slot_apply_http_detail(
+    exc: SlotApplyEpochMismatch | SlotApplyHandleNotFound | SlotApplyGuardMismatch,
+) -> dict[str, Any]:
+    if isinstance(exc, SlotApplyEpochMismatch):
+        return {
+            "error": {
+                "code": "slot_apply_epoch_mismatch",
+                "message": str(exc),
+                "details": {
+                    "model": exc.model_id,
+                    "request_handle": exc.request_handle,
+                },
+            }
+        }
+    if isinstance(exc, SlotApplyHandleNotFound):
+        return {
+            "error": {
+                "code": "slot_handle_not_found",
+                "message": str(exc),
+                "details": {
+                    "model": exc.model_id,
+                    "request_handle": exc.request_handle,
+                },
+            }
+        }
+    return {
+        "error": {
+            "code": "slot_apply_guard_mismatch",
+            "message": str(exc),
+            "details": {
+                "field": exc.field,
+                "expected": exc.expected,
+                "observed": exc.observed,
+                "model": exc.model_id,
+                "request_handle": exc.request_handle,
+            },
+        }
+    }
 
 
 def get_max_context_window(model_id: str | None = None) -> int | None:
@@ -1377,9 +1420,11 @@ def init_server(
     if _slot_runtime_enabled():
         slot_path = Path(global_settings.slot_save_path).expanduser().resolve()
         _server_state.slot_store = SlotStore(slot_path)
+        _server_state.one_shot_bind_table = OneShotBindTable()
         logger.info("Slot API enabled at %s", slot_path)
     else:
         _server_state.slot_store = None
+        _server_state.one_shot_bind_table = None
 
     response_state_dir = None
     if global_settings:
@@ -2017,6 +2062,17 @@ async def slot_action(
                     payload_bytes,
                     manifest,
                 )
+                restore_epoch = uuid.uuid4().hex
+                bind = OneShotBind(
+                    model_id=resolved_model,
+                    request_handle=request_handle,
+                    payload_bytes=payload_bytes,
+                    manifest=manifest,
+                    restore_epoch=restore_epoch,
+                )
+                if _server_state.one_shot_bind_table is None:
+                    _server_state.one_shot_bind_table = OneShotBindTable()
+                await _server_state.one_shot_bind_table.put(bind)
         except SlotBusy as exc:
             raise HTTPException(
                 status_code=423,
@@ -2089,6 +2145,7 @@ async def slot_action(
             "filename": filename,
             "request_handle": request_handle,
             "n_restored": n_restored,
+            "restore_epoch": restore_epoch,
         }
 
     if _is_slot_generating(resolved_model):
@@ -2807,6 +2864,11 @@ async def create_chat_completion(
 
     if request.stop:
         chat_kwargs["stop"] = request.stop
+    if request.x_omlx_request_handle is not None:
+        chat_kwargs["x_omlx_request_handle"] = request.x_omlx_request_handle
+        chat_kwargs["x_omlx_model_id"] = resolved_model
+    if request.x_omlx_restore_epoch is not None:
+        chat_kwargs["x_omlx_restore_epoch"] = request.x_omlx_restore_epoch
 
     if request.stream:
         return StreamingResponse(
@@ -2822,8 +2884,14 @@ async def create_chat_completion(
     # Non-streaming response with keepalive during prefill
     async def _build_chat_completion():
         start_time = time.perf_counter()
-
-        output = await engine.chat(messages=messages, **chat_kwargs)
+        try:
+            output = await engine.chat(messages=messages, **chat_kwargs)
+        except (
+            SlotApplyEpochMismatch,
+            SlotApplyHandleNotFound,
+            SlotApplyGuardMismatch,
+        ) as exc:
+            raise HTTPException(status_code=409, detail=_slot_apply_http_detail(exc))
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -2914,6 +2982,10 @@ async def create_chat_completion(
                 total_time=round(elapsed, 2),
             ),
         ).model_dump_json(exclude_none=True)
+
+    if request.x_omlx_request_handle is not None:
+        payload = await _build_chat_completion()
+        return JSONResponse(content=json.loads(payload))
 
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_chat_completion()),

@@ -132,6 +132,9 @@ class Request:
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
+    x_omlx_request_handle: Optional[str] = None
+    x_omlx_restore_epoch: Optional[str] = None
+    x_omlx_model_id: Optional[str] = None
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache

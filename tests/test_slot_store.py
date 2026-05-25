@@ -7,6 +7,8 @@ import pytest
 
 from omlx.slot_store import (
     InvalidFilename,
+    OneShotBind,
+    OneShotBindTable,
     SlotBusy,
     SlotGuardMismatch,
     SlotManifest,
@@ -352,48 +354,17 @@ async def test_v2a_save_writes_real_safetensors_bytes(tmp_path):
 
 
 def test_v2a_save_restore_round_trip_via_mlx_lm():
-    from omlx.server import _apply_slot_restore_payload, _serialize_slot_payload, _server_state
+    from omlx.server import _apply_slot_restore_payload, _serialize_slot_payload
 
-    original_scratch = getattr(_server_state, "_slot_v2a_last_loaded", None)
-    try:
-        source_cache = _build_real_prompt_cache(n_layers=2, seq_len=3, head_dim=2)
-        entry = _build_slot_entry(source_cache, cached_tokens=9)
-        payload_bytes, _ = _serialize_slot_payload(entry, model_id="test-model")
-        restored = _apply_slot_restore_payload(
-            entry,
-            payload_bytes,
-            _manifest(n_tokens=9),
-        )
-        assert restored == 9
-
-        parked = _server_state._slot_v2a_last_loaded
-        assert parked is not None
-        loaded_cache = parked["cache"]
-        assert len(loaded_cache) == len(source_cache)
-        for original, loaded in zip(source_cache, loaded_cache):
-            original_keys, original_values = original.state
-            assert loaded.keys.shape == original_keys.shape
-            assert loaded.values.shape == original_values.shape
-    finally:
-        _server_state._slot_v2a_last_loaded = original_scratch
-
-
-def test_v2a_apply_parks_loaded_cache_in_scratch():
-    from omlx.server import _apply_slot_restore_payload, _serialize_slot_payload, _server_state
-
-    original_scratch = getattr(_server_state, "_slot_v2a_last_loaded", None)
-    try:
-        entry = _build_slot_entry(_build_real_prompt_cache(n_layers=1), cached_tokens=4)
-        payload_bytes, _ = _serialize_slot_payload(entry, model_id="test-model")
-        manifest = _manifest(n_tokens=4)
-        _apply_slot_restore_payload(entry, payload_bytes, manifest)
-
-        parked = _server_state._slot_v2a_last_loaded
-        assert parked is not None
-        assert parked["manifest"] == manifest
-        assert "cache" in parked
-    finally:
-        _server_state._slot_v2a_last_loaded = original_scratch
+    source_cache = _build_real_prompt_cache(n_layers=2, seq_len=3, head_dim=2)
+    entry = _build_slot_entry(source_cache, cached_tokens=9)
+    payload_bytes, _ = _serialize_slot_payload(entry, model_id="test-model")
+    restored = _apply_slot_restore_payload(
+        entry,
+        payload_bytes,
+        _manifest(n_tokens=9),
+    )
+    assert restored == 9
 
 
 def test_v2a_apply_n_restored_comes_from_file_metadata_when_present():
@@ -426,3 +397,106 @@ def test_v2a_apply_n_restored_falls_back_to_manifest_when_metadata_missing():
     entry = _build_slot_entry(cache_layers, cached_tokens=1)
     n_restored = _apply_slot_restore_payload(entry, payload_bytes, _manifest(n_tokens=99))
     assert n_restored == 99
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_put_consume_returns_entry_with_matching_epoch():
+    table = OneShotBindTable()
+    bind = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"abc",
+        manifest=_manifest(n_tokens=7),
+        restore_epoch="epoch-1",
+    )
+    await table.put(bind)
+
+    consumed = await table.consume("m", "h", "epoch-1")
+    assert consumed == bind
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_consume_returns_none_on_no_entry():
+    table = OneShotBindTable()
+    consumed = await table.consume("m", "missing", "epoch-1")
+    assert consumed is None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_consume_returns_none_on_epoch_mismatch_and_drops_entry():
+    table = OneShotBindTable()
+    bind = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"abc",
+        manifest=_manifest(n_tokens=3),
+        restore_epoch="expected",
+    )
+    await table.put(bind)
+
+    consumed = await table.consume("m", "h", "wrong")
+    assert consumed is None
+    assert await table.consume_any("m", "h") is None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_consume_is_idempotent_after_consume():
+    table = OneShotBindTable()
+    bind = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"abc",
+        manifest=_manifest(n_tokens=5),
+        restore_epoch="epoch",
+    )
+    await table.put(bind)
+
+    first = await table.consume("m", "h", "epoch")
+    second = await table.consume("m", "h", "epoch")
+    assert first == bind
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_put_overwrites_prior_entry_for_same_key():
+    table = OneShotBindTable()
+    first = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"first",
+        manifest=_manifest(n_tokens=1),
+        restore_epoch="epoch-a",
+    )
+    second = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"second",
+        manifest=_manifest(n_tokens=2),
+        restore_epoch="epoch-b",
+    )
+    await table.put(first)
+    await table.put(second)
+
+    consumed = await table.consume("m", "h", "epoch-b")
+    assert consumed == second
+    assert await table.consume_any("m", "h") is None
+
+
+@pytest.mark.asyncio
+async def test_one_shot_bind_concurrent_consume_only_one_wins():
+    table = OneShotBindTable()
+    bind = OneShotBind(
+        model_id="m",
+        request_handle="h",
+        payload_bytes=b"abc",
+        manifest=_manifest(n_tokens=8),
+        restore_epoch="epoch-1",
+    )
+    await table.put(bind)
+
+    first, second = await asyncio.gather(
+        table.consume("m", "h", "epoch-1"),
+        table.consume("m", "h", "epoch-1"),
+    )
+    winners = [result for result in (first, second) if result is not None]
+    assert winners == [bind]

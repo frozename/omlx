@@ -23,6 +23,14 @@ import pytest
 
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
+from omlx.slot_store import (
+    OneShotBind,
+    OneShotBindTable,
+    SlotApplyEpochMismatch,
+    SlotApplyGuardMismatch,
+    SlotApplyHandleNotFound,
+    SlotManifest,
+)
 
 
 class TestSchedulerConfig:
@@ -370,6 +378,183 @@ class TestSchedulerAddRequest:
         assert request.remaining_tokens == [31, 32, 33, 34]
         assert request.prompt_cache is None
         scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-rotating")
+
+
+class TestSchedulerOneShotBindApply:
+    """Tests for Scheduler.try_apply_one_shot_bind()."""
+
+    @staticmethod
+    def _manifest(*, fingerprint: str = "fp-a", ctx_size: int = 32768, n_tokens: int = 5) -> SlotManifest:
+        return SlotManifest(
+            slot_format_version=1,
+            model_fingerprint=fingerprint,
+            model_id="test-model",
+            ctx_size=ctx_size,
+            n_tokens=n_tokens,
+            tensors=[{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+            cache_class="paged_ssd",
+            producer={"mlx_version": "0.0.0", "omlx_cache_format_version": "v1"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_returns_false_when_handle_missing(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="req-1",
+            prompt=[10, 11, 12],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [10, 11, 12]
+
+        applied = await scheduler.try_apply_one_shot_bind(request)
+        assert applied is False
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_attaches_cache_and_returns_true_on_match(
+        self, mock_model, mock_tokenizer
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        bind = OneShotBind(
+            model_id="test-model",
+            request_handle="handle-a",
+            payload_bytes=b"payload-a",
+            manifest=self._manifest(n_tokens=3),
+            restore_epoch="epoch-a",
+        )
+        await table.put(bind)
+
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-2",
+                prompt=[1, 2, 3, 4, 5],
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="handle-a",
+                x_omlx_restore_epoch="epoch-a",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = [1, 2, 3, 4, 5]
+
+            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
+
+            applied = await scheduler.try_apply_one_shot_bind(request)
+            assert applied is True
+            assert request.prompt_cache == ["cache-ok"]
+            assert request.cached_tokens == 3
+            assert request.remaining_tokens == [4, 5]
+            assert await table.consume_any("test-model", "handle-a") is None
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_raises_epoch_mismatch_and_consumes_bind(
+        self, mock_model, mock_tokenizer
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="handle-a",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(),
+                restore_epoch="epoch-good",
+            )
+        )
+
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-3",
+                prompt=[1, 2, 3],
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="handle-a",
+                x_omlx_restore_epoch="epoch-bad",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = [1, 2, 3]
+
+            with pytest.raises(SlotApplyEpochMismatch):
+                await scheduler.try_apply_one_shot_bind(request)
+            assert await table.consume_any("test-model", "handle-a") is None
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_raises_handle_not_found_when_no_entry(
+        self, mock_model, mock_tokenizer
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-4",
+                prompt=[1, 2, 3],
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="missing",
+                x_omlx_restore_epoch="epoch-a",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = [1, 2, 3]
+            with pytest.raises(SlotApplyHandleNotFound):
+                await scheduler.try_apply_one_shot_bind(request)
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_raises_guard_mismatch_on_fingerprint_change(
+        self, mock_model, mock_tokenizer
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="handle-a",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(fingerprint="fp-a"),
+                restore_epoch="epoch-a",
+            )
+        )
+
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-5",
+                prompt=[1, 2, 3],
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="handle-a",
+                x_omlx_restore_epoch="epoch-a",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = [1, 2, 3]
+
+            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-b", 32768)  # type: ignore[method-assign]
+
+            with pytest.raises(SlotApplyGuardMismatch) as exc:
+                await scheduler.try_apply_one_shot_bind(request)
+            assert exc.value.field == "model_fingerprint"
+            assert await table.consume_any("test-model", "handle-a") is None
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
 
 
 class TestSchedulerAbortRequest:

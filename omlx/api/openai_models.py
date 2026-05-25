@@ -256,6 +256,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Slot v2 Phase 2 apply-linkage fields (vendor-prefixed)
+    x_omlx_request_handle: Optional[str] = None
+    x_omlx_restore_epoch: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod

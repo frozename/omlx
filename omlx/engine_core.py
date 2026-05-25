@@ -285,6 +285,9 @@ class EngineCore:
         vlm_image_hash: Optional[str] = None,
         vlm_cache_key_start: int = 0,
         vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
+        x_omlx_request_handle: Optional[str] = None,
+        x_omlx_restore_epoch: Optional[str] = None,
+        x_omlx_model_id: Optional[str] = None,
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
@@ -326,6 +329,9 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            x_omlx_request_handle=x_omlx_request_handle,
+            x_omlx_restore_epoch=x_omlx_restore_epoch,
+            x_omlx_model_id=x_omlx_model_id,
         )
 
         # SpecPrefill: resolve per-request settings.

@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,6 +25,9 @@ from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 from omlx.mcp.types import MCPToolResult
 from omlx.settings import GlobalSettings
+from omlx.request import Request, SamplingParams
+from omlx.scheduler import Scheduler
+from omlx.slot_store import OneShotBind, OneShotBindTable, SlotManifest
 
 
 @dataclass
@@ -358,6 +362,7 @@ class TestSlotSaveEndpoint:
             def __init__(self, path):
                 self.model_path = str(path)
                 self.engine = None
+                self.preserve_thinking_default = False
 
         entry = _Entry(model_dir)
         pool.get_entry = lambda model_id: entry
@@ -369,6 +374,7 @@ class TestSlotSaveEndpoint:
         server_state.engine_pool = pool
         server_state.default_model = "test-model"
         server_state.api_key = None
+        server_state.one_shot_bind_table = OneShotBindTable()
 
     def _patch_minimal_slot_payload(self, monkeypatch, payload_size: int = 8):
         import omlx.server as server_module
@@ -1064,6 +1070,7 @@ class TestSlotRestoreEndpoint:
             def __init__(self, path):
                 self.model_path = str(path)
                 self.engine = None
+                self.preserve_thinking_default = False
 
         entry = _Entry(model_dir)
         pool.get_entry = lambda model_id: entry
@@ -1075,6 +1082,7 @@ class TestSlotRestoreEndpoint:
         server_state.engine_pool = pool
         server_state.default_model = "test-model"
         server_state.api_key = None
+        server_state.one_shot_bind_table = OneShotBindTable()
 
     def _write_restore_files(self, slot_dir, filename, payload, manifest_dict):
         (slot_dir / filename).write_bytes(payload)
@@ -1437,10 +1445,10 @@ class TestSlotRestoreEndpoint:
         original_settings = _server_state.global_settings
         original_api_key = _server_state.api_key
         original_slot_store = getattr(_server_state, "slot_store", None)
-        original_scratch = getattr(_server_state, "_slot_v2a_last_loaded", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
         try:
             self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
-            _server_state._slot_v2a_last_loaded = None
+            _server_state.one_shot_bind_table = OneShotBindTable()
 
             def fake_extract_slot_request_payload(_entry):
                 cache_layers = []
@@ -1486,7 +1494,7 @@ class TestSlotRestoreEndpoint:
             _server_state.global_settings = original_settings
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
-            _server_state._slot_v2a_last_loaded = original_scratch
+            _server_state.one_shot_bind_table = original_bind_table
 
     def test_v2_phase1a_restore_accepts_request_handle(
         self, tmp_path, mock_engine_pool, monkeypatch
@@ -1522,6 +1530,302 @@ class TestSlotRestoreEndpoint:
             body = restore_response.json()
             assert body["request_handle"] == "roundtrip"
             assert body["filename"] == "roundtrip.kvslot"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase2_restore_returns_restore_epoch(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(server_module, "_serialize_slot_payload", lambda *args, **kwargs: (b"payload", {"n_tokens": 7, "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}], "cache_class": "paged_ssd"}))
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 7)
+            client = TestClient(app)
+
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "phase2-handle"},
+            )
+            assert save_response.status_code == 200
+
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "phase2-handle"},
+            )
+            assert restore_response.status_code == 200
+            body = restore_response.json()
+            assert body["restore_epoch"]
+            assert isinstance(body["restore_epoch"], str)
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_phase2_full_round_trip_apply(
+        self, tmp_path, mock_engine_pool, mock_llm_engine, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(server_module, "_serialize_slot_payload", lambda *args, **kwargs: (b"payload", {"n_tokens": 6, "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}], "cache_class": "paged_ssd"}))
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 6)
+
+            scheduler = Scheduler(model=MagicMock(), tokenizer=MockTokenizer())
+
+            async def fake_chat(messages, **kwargs):
+                del messages
+                req = Request(
+                    request_id="req-e2e",
+                    prompt=[1, 2, 3, 4, 5, 6, 7],
+                    sampling_params=SamplingParams(max_tokens=16),
+                    x_omlx_request_handle=kwargs.get("x_omlx_request_handle"),
+                    x_omlx_restore_epoch=kwargs.get("x_omlx_restore_epoch"),
+                    x_omlx_model_id=kwargs.get("x_omlx_model_id"),
+                )
+                req.prompt_token_ids = [1, 2, 3, 4, 5, 6, 7]
+                table = _server_state.one_shot_bind_table
+                key = ("test-model", req.x_omlx_request_handle)
+                bind = table._entries[key]  # noqa: SLF001
+                scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+                scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
+                applied = await scheduler.try_apply_one_shot_bind(req)
+                return MockGenerationOutput(
+                    text="Chat response.",
+                    prompt_tokens=7,
+                    completion_tokens=2,
+                    finish_reason="stop",
+                    finished=True,
+                    cached_tokens=req.cached_tokens if applied else 0,
+                )
+
+            mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)
+
+            client = TestClient(app)
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert save_response.status_code == 200
+
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert restore_response.status_code == 200
+            restore_body = restore_response.json()
+            assert restore_body["restore_epoch"]
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": restore_body["restore_epoch"],
+                },
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_phase2_request_with_handle_but_wrong_epoch_returns_409(
+        self, tmp_path, mock_engine_pool, mock_llm_engine, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(server_module, "_serialize_slot_payload", lambda *args, **kwargs: (b"payload", {"n_tokens": 6, "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}], "cache_class": "paged_ssd"}))
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 6)
+
+            scheduler = Scheduler(model=MagicMock(), tokenizer=MockTokenizer())
+
+            async def fake_chat(messages, **kwargs):
+                del messages
+                req = Request(
+                    request_id="req-wrong-epoch",
+                    prompt=[1, 2, 3],
+                    sampling_params=SamplingParams(max_tokens=16),
+                    x_omlx_request_handle=kwargs.get("x_omlx_request_handle"),
+                    x_omlx_restore_epoch=kwargs.get("x_omlx_restore_epoch"),
+                    x_omlx_model_id=kwargs.get("x_omlx_model_id"),
+                )
+                req.prompt_token_ids = [1, 2, 3]
+                scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+                bind = _server_state.one_shot_bind_table._entries[("test-model", "roundtrip")]  # noqa: SLF001
+                scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
+                await scheduler.try_apply_one_shot_bind(req)
+                return MockGenerationOutput(text="unused")
+
+            mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)
+            client = TestClient(app)
+
+            assert client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            ).status_code == 200
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert restore_response.status_code == 200
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": "wrong-epoch",
+                },
+            )
+            assert response.status_code == 409
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_phase2_request_with_handle_no_parked_entry_returns_409(
+        self, tmp_path, mock_engine_pool, mock_llm_engine
+    ):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            _server_state.one_shot_bind_table = OneShotBindTable()
+            scheduler = Scheduler(model=MagicMock(), tokenizer=MockTokenizer())
+
+            async def fake_chat(messages, **kwargs):
+                del messages
+                req = Request(
+                    request_id="req-no-entry",
+                    prompt=[1, 2, 3],
+                    sampling_params=SamplingParams(max_tokens=16),
+                    x_omlx_request_handle=kwargs.get("x_omlx_request_handle"),
+                    x_omlx_restore_epoch=kwargs.get("x_omlx_restore_epoch"),
+                    x_omlx_model_id=kwargs.get("x_omlx_model_id"),
+                )
+                req.prompt_token_ids = [1, 2, 3]
+                await scheduler.try_apply_one_shot_bind(req)
+                return MockGenerationOutput(text="unused")
+
+            mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)
+            client = TestClient(app)
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "missing",
+                    "x_omlx_restore_epoch": "epoch-a",
+                },
+            )
+            assert response.status_code == 409
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_phase2_n_saved_equals_cached_tokens(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import mlx.core as mx
+        import omlx.server as server_module
+        from mlx_lm.models.cache import KVCache
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+
+            def fake_extract_slot_request_payload(_entry):
+                cache = KVCache()
+                keys = mx.full((1, 1, 3, 2), 1, dtype=mx.float16)
+                values = mx.full((1, 1, 3, 2), 2, dtype=mx.float16)
+                cache.update_and_fetch(keys, values)
+                return [cache], 11, [99]
+
+            monkeypatch.setattr(
+                server_module,
+                "_extract_slot_request_payload",
+                fake_extract_slot_request_payload,
+            )
+            client = TestClient(app)
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "nsaved"},
+            )
+            assert save_response.status_code == 200
+            assert save_response.json()["n_saved"] == 11
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default

@@ -1571,6 +1571,14 @@ class VLMBatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        request_kwargs = {}
+        if kwargs.get("x_omlx_request_handle") is not None:
+            request_kwargs["x_omlx_request_handle"] = kwargs.get("x_omlx_request_handle")
+        if kwargs.get("x_omlx_restore_epoch") is not None:
+            request_kwargs["x_omlx_restore_epoch"] = kwargs.get("x_omlx_restore_epoch")
+        if kwargs.get("x_omlx_model_id") is not None:
+            request_kwargs["x_omlx_model_id"] = kwargs.get("x_omlx_model_id")
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -1579,6 +1587,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            **request_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -1651,6 +1660,16 @@ class VLMBatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
+        if kwargs.get("x_omlx_request_handle") is not None:
+            specprefill_kwargs["x_omlx_request_handle"] = kwargs.get(
+                "x_omlx_request_handle"
+            )
+        if kwargs.get("x_omlx_restore_epoch") is not None:
+            specprefill_kwargs["x_omlx_restore_epoch"] = kwargs.get(
+                "x_omlx_restore_epoch"
+            )
+        if kwargs.get("x_omlx_model_id") is not None:
+            specprefill_kwargs["x_omlx_model_id"] = kwargs.get("x_omlx_model_id")
 
         engine = self._engine
         request_id = await engine.add_request(
