@@ -702,6 +702,322 @@ class TestSlotSaveEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
 
+    def test_v2_phase1a_save_accepts_request_handle(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "my_handle"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["request_handle"] == "my_handle"
+            assert body["filename"] == "my_handle.kvslot"
+            assert (slot_dir / "my_handle.kvslot").exists()
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_save_rejects_invalid_request_handle_charset(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "../escape"},
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"] == "invalid_request_handle"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_save_rejects_request_handle_too_long(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "a" * 129},
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"] == "invalid_request_handle"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_save_rejects_request_handle_empty(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": ""},
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"] == "invalid_request_handle"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_save_rejects_inconsistent_handle_filename(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "filename": "a.kvslot", "request_handle": "b"},
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"] == "inconsistent_handle_filename"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_save_default_handle_when_omitted_for_slot0(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post("/slots/0?action=save", json={"model": "test-model"})
+            assert response.status_code == 200
+            body = response.json()
+            assert body["request_handle"] == "default"
+            assert body["filename"] == "default.kvslot"
+            assert (slot_dir / "default.kvslot").exists()
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_save_filename_implies_handle(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "x.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["request_handle"] == "x"
+            assert body["filename"] == "x.kvslot"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_capability_bit_present_when_slot_api_enabled(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            client = TestClient(app)
+
+            response = client.get("/v1/slots/capabilities")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["slot_api_version"] == "0.1.0"
+            assert body["slot_save_path_configured"] is True
+            assert body["slots"]["api_version"] == 2
+            assert body["slots"]["supports_request_handle"] is True
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_capability_bit_absent_when_slot_api_disabled(
+        self, tmp_path, mock_engine_pool
+    ):
+        from omlx.server import app, _server_state
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            _server_state.engine_pool = mock_engine_pool
+            _server_state.default_model = "test-model"
+            _server_state.global_settings = GlobalSettings()
+            _server_state.api_key = None
+            _server_state.slot_store = None
+            client = TestClient(app)
+
+            response = client.get("/v1/slots/capabilities")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["slot_save_path_configured"] is False
+            assert body["slots"]["api_version"] == 0
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_phase1a_v1_alias_still_works(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "legacy.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["filename"] == "legacy.kvslot"
+            assert body["request_handle"] == "legacy"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
     def test_save_busy_returns_409_not_423_when_state_is_restoring(
         self, tmp_path, mock_engine_pool, monkeypatch
     ):
@@ -1171,6 +1487,47 @@ class TestSlotRestoreEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
             _server_state._slot_v2a_last_loaded = original_scratch
+
+    def test_v2_phase1a_restore_accepts_request_handle(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(server_module, "_serialize_slot_payload", lambda *args, **kwargs: (b"payload", {"n_tokens": 123, "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}], "cache_class": "paged_ssd"}))
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 123)
+            client = TestClient(app)
+
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert save_response.status_code == 200
+
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert restore_response.status_code == 200
+            body = restore_response.json()
+            assert body["request_handle"] == "roundtrip"
+            assert body["filename"] == "roundtrip.kvslot"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
 
 class TestHealthEndpoint:
     """Tests for the /health endpoint."""

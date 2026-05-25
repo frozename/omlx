@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -169,6 +170,8 @@ def check_restore_guards(
 
 
 class SlotStore:
+    _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
     def __init__(self, slot_save_path: Path) -> None:
         self._slot_save_path = Path(slot_save_path).expanduser().resolve()
         self._slot_save_path.mkdir(parents=True, exist_ok=True)
@@ -181,6 +184,8 @@ class SlotStore:
         filename = raw.strip()
         if not filename:
             raise InvalidFilename("filename cannot be empty")
+        if not self._VALID_NAME_RE.fullmatch(filename):
+            raise InvalidFilename("filename contains invalid characters")
         path = Path(filename)
         if path.is_absolute():
             raise InvalidFilename("absolute path is not allowed")

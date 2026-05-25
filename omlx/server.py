@@ -190,6 +190,7 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 SLOT_API_VERSION = "0.1.0"
 SLOT_ALLOWED_ACTIONS = {"save", "restore"}
+DEFAULT_SLOT_REQUEST_HANDLE = "default"
 
 
 # =============================================================================
@@ -290,6 +291,50 @@ def _get_slot_store() -> SlotStore:
     ):
         _server_state.slot_store = SlotStore(slot_path)
     return _server_state.slot_store
+
+
+def _resolve_slot_request_handle_and_filename(
+    slot_store: SlotStore, payload: dict[str, object], slot_id: int
+) -> tuple[str, str]:
+    raw_filename = payload.get("filename")
+    raw_request_handle = payload.get("request_handle")
+
+    filename: str | None = None
+    request_handle: str | None = None
+
+    if raw_filename is not None:
+        if not isinstance(raw_filename, str):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        try:
+            filename = slot_store.validate_filename(raw_filename)
+        except InvalidFilename as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    if raw_request_handle is not None:
+        if not isinstance(raw_request_handle, str):
+            raise HTTPException(status_code=400, detail="invalid_request_handle")
+        try:
+            request_handle = slot_store.validate_filename(raw_request_handle)
+        except InvalidFilename:
+            raise HTTPException(status_code=400, detail="invalid_request_handle")
+
+    if filename is not None and request_handle is not None:
+        if filename.removesuffix(".kvslot") != request_handle:
+            raise HTTPException(
+                status_code=400, detail="inconsistent_handle_filename"
+            )
+        return request_handle, filename
+
+    if request_handle is not None:
+        return request_handle, f"{request_handle}.kvslot"
+
+    if filename is not None:
+        return filename.removesuffix(".kvslot"), filename
+
+    if slot_id == 0:
+        return DEFAULT_SLOT_REQUEST_HANDLE, f"{DEFAULT_SLOT_REQUEST_HANDLE}.kvslot"
+
+    raise HTTPException(status_code=400, detail="Invalid filename")
 
 
 def get_mcp_manager():
@@ -1876,12 +1921,16 @@ async def slot_capabilities(_: bool = Depends(verify_api_key)):
     max_concurrent = (
         settings.scheduler.max_concurrent_requests if settings is not None else 0
     )
+    slots = {"api_version": 0}
+    if _slot_runtime_enabled():
+        slots = {"api_version": 2, "supports_request_handle": True}
     return {
         "slot_api_version": SLOT_API_VERSION,
         "actions": ["save", "restore"],
         "slot_count": 1,
         "max_concurrent_requests": max_concurrent,
         "slot_save_path_configured": _slot_runtime_enabled(),
+        "slots": slots,
     }
 
 
@@ -1929,13 +1978,9 @@ async def slot_action(
         )
 
     slot_store = _get_slot_store()
-    raw_filename = payload.get("filename")
-    if not isinstance(raw_filename, str):
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    try:
-        filename = slot_store.validate_filename(raw_filename)
-    except InvalidFilename as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    request_handle, filename = _resolve_slot_request_handle_and_filename(
+        slot_store, payload, slot_id
+    )
 
     if action == "restore":
         if _is_slot_generating(resolved_model):
@@ -2042,6 +2087,7 @@ async def slot_action(
             "id_slot": slot_id,
             "model": resolved_model,
             "filename": filename,
+            "request_handle": request_handle,
             "n_restored": n_restored,
         }
 
@@ -2119,6 +2165,7 @@ async def slot_action(
         "id_slot": slot_id,
         "model": resolved_model,
         "filename": filename,
+        "request_handle": request_handle,
         "n_saved": n_saved,
     }
 
