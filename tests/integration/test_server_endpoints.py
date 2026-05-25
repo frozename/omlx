@@ -1106,6 +1106,72 @@ class TestSlotRestoreEndpoint:
             _server_state.api_key = original_api_key
             _server_state.slot_store = original_slot_store
 
+    def test_v2a_save_restore_endpoint_round_trip_via_v1_alias(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import mlx.core as mx
+        import omlx.server as server_module
+        from mlx_lm.models.cache import KVCache, load_prompt_cache
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_scratch = getattr(_server_state, "_slot_v2a_last_loaded", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            _server_state._slot_v2a_last_loaded = None
+
+            def fake_extract_slot_request_payload(_entry):
+                cache_layers = []
+                for i in range(2):
+                    cache = KVCache()
+                    keys = mx.full((1, 1, 3, 2), i + 1, dtype=mx.float16)
+                    values = mx.full((1, 1, 3, 2), i + 2, dtype=mx.float16)
+                    cache.update_and_fetch(keys, values)
+                    cache_layers.append(cache)
+                return cache_layers, 11, [4]
+
+            monkeypatch.setattr(
+                server_module,
+                "_extract_slot_request_payload",
+                fake_extract_slot_request_payload,
+            )
+
+            client = TestClient(app)
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+            )
+            assert save_response.status_code == 200, save_response.text
+            n_saved = save_response.json()["n_saved"]
+
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+            )
+            assert restore_response.status_code == 200
+            assert restore_response.json()["n_restored"] == n_saved
+
+            saved_path = slot_dir / "slot-roundtrip.safetensors"
+            loaded_cache, file_metadata = load_prompt_cache(
+                str(saved_path),
+                return_metadata=True,
+            )
+            assert len(loaded_cache) == 2
+            assert file_metadata.get("cached_tokens") == str(n_saved)
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state._slot_v2a_last_loaded = original_scratch
+
 class TestHealthEndpoint:
     """Tests for the /health endpoint."""
 

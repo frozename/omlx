@@ -18,6 +18,49 @@ from omlx.slot_store import (
 )
 
 
+def _build_real_prompt_cache(n_layers: int = 2, seq_len: int = 2, head_dim: int = 2):
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    cache_layers = []
+    for i in range(n_layers):
+        cache = KVCache()
+        keys = mx.full((1, 1, seq_len, head_dim), i + 1, dtype=mx.float16)
+        values = mx.full((1, 1, seq_len, head_dim), i + 2, dtype=mx.float16)
+        cache.update_and_fetch(keys, values)
+        cache_layers.append(cache)
+    return cache_layers
+
+
+def _build_slot_entry(prompt_cache, cached_tokens: int = 7):
+    class _Req:
+        def __init__(self):
+            self.prompt_cache = prompt_cache
+            self.cached_tokens = cached_tokens
+            self.remaining_tokens = [1, 2]
+
+    class _Scheduler:
+        def __init__(self):
+            self.requests = {"req-1": _Req()}
+
+        def snapshot_for_admin(self):
+            return {"running_by_id": {}, "waiting": []}
+
+    class _EngineCore:
+        def __init__(self):
+            self.engine = type("_Inner", (), {"scheduler": _Scheduler()})()
+
+    class _Engine:
+        def __init__(self):
+            self._engine = _EngineCore()
+
+    class _Entry:
+        def __init__(self):
+            self.engine = _Engine()
+
+    return _Entry()
+
+
 def _manifest(n_tokens: int = 3) -> SlotManifest:
     return SlotManifest(
         slot_format_version=1,
@@ -284,3 +327,102 @@ def test_model_fingerprint_is_stable(tmp_path):
     assert fp1 == fp2
     assert isinstance(fp1, str)
     assert len(fp1) == 64
+
+
+@pytest.mark.asyncio
+async def test_v2a_save_writes_real_safetensors_bytes(tmp_path):
+    from omlx.server import _serialize_slot_payload
+
+    entry = _build_slot_entry(_build_real_prompt_cache(n_layers=1), cached_tokens=5)
+    payload_bytes, metadata = _serialize_slot_payload(entry, model_id="test-model")
+
+    store = SlotStore(tmp_path)
+    await store.write_atomic(
+        slot_id=0,
+        filename="slot-v2a.kvslot",
+        payload=payload_bytes,
+        manifest=_manifest(n_tokens=metadata["n_tokens"]),
+    )
+
+    on_disk = (tmp_path / "slot-v2a.kvslot").read_bytes()
+    assert on_disk[:1] != b"{"
+    metadata_len = int.from_bytes(on_disk[:8], "little")
+    assert metadata_len > 0
+    assert on_disk[8:9] == b"{"
+
+
+def test_v2a_save_restore_round_trip_via_mlx_lm():
+    from omlx.server import _apply_slot_restore_payload, _serialize_slot_payload, _server_state
+
+    original_scratch = getattr(_server_state, "_slot_v2a_last_loaded", None)
+    try:
+        source_cache = _build_real_prompt_cache(n_layers=2, seq_len=3, head_dim=2)
+        entry = _build_slot_entry(source_cache, cached_tokens=9)
+        payload_bytes, _ = _serialize_slot_payload(entry, model_id="test-model")
+        restored = _apply_slot_restore_payload(
+            entry,
+            payload_bytes,
+            _manifest(n_tokens=9),
+        )
+        assert restored == 9
+
+        parked = _server_state._slot_v2a_last_loaded
+        assert parked is not None
+        loaded_cache = parked["cache"]
+        assert len(loaded_cache) == len(source_cache)
+        for original, loaded in zip(source_cache, loaded_cache):
+            original_keys, original_values = original.state
+            assert loaded.keys.shape == original_keys.shape
+            assert loaded.values.shape == original_values.shape
+    finally:
+        _server_state._slot_v2a_last_loaded = original_scratch
+
+
+def test_v2a_apply_parks_loaded_cache_in_scratch():
+    from omlx.server import _apply_slot_restore_payload, _serialize_slot_payload, _server_state
+
+    original_scratch = getattr(_server_state, "_slot_v2a_last_loaded", None)
+    try:
+        entry = _build_slot_entry(_build_real_prompt_cache(n_layers=1), cached_tokens=4)
+        payload_bytes, _ = _serialize_slot_payload(entry, model_id="test-model")
+        manifest = _manifest(n_tokens=4)
+        _apply_slot_restore_payload(entry, payload_bytes, manifest)
+
+        parked = _server_state._slot_v2a_last_loaded
+        assert parked is not None
+        assert parked["manifest"] == manifest
+        assert "cache" in parked
+    finally:
+        _server_state._slot_v2a_last_loaded = original_scratch
+
+
+def test_v2a_apply_n_restored_comes_from_file_metadata_when_present():
+    from omlx.server import _apply_slot_restore_payload, _serialize_slot_payload
+
+    entry = _build_slot_entry(_build_real_prompt_cache(n_layers=1), cached_tokens=42)
+    payload_bytes, _ = _serialize_slot_payload(entry, model_id="test-model")
+    n_restored = _apply_slot_restore_payload(entry, payload_bytes, _manifest(n_tokens=99))
+    assert n_restored == 42
+
+
+def test_v2a_apply_n_restored_falls_back_to_manifest_when_metadata_missing():
+    from mlx_lm.models.cache import save_prompt_cache
+    from omlx.server import _apply_slot_restore_payload
+    import tempfile
+    import os
+
+    cache_layers = _build_real_prompt_cache(n_layers=1)
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        save_prompt_cache(tmp_path, cache_layers, metadata={})
+        payload_bytes = Path(tmp_path).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    entry = _build_slot_entry(cache_layers, cached_tokens=1)
+    n_restored = _apply_slot_restore_payload(entry, payload_bytes, _manifest(n_tokens=99))
+    assert n_restored == 99

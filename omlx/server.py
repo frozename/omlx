@@ -242,6 +242,7 @@ class ServerState:
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
     slot_store: Optional[SlotStore] = None
+    _slot_v2a_last_loaded: Optional[dict[str, Any]] = None
 
 
 # Global server state instance
@@ -1137,29 +1138,44 @@ def _extract_slot_request_payload(entry) -> tuple[Any, int, list[int] | None]:
 
 def _serialize_slot_payload(entry, model_id: str) -> tuple[bytes, dict[str, Any]]:
     """Serialize slot payload into bytes plus metadata for the manifest."""
-    cache, cached_tokens, remaining_tokens = _extract_slot_request_payload(entry)
+    import mlx.core as mx
+    from mlx_lm.models.cache import save_prompt_cache
+    import tempfile
+
+    cache, cached_tokens, _remaining_tokens = _extract_slot_request_payload(entry)
     cache_items = list(cache) if isinstance(cache, (list, tuple)) else [cache]
-    tensors = [
-        {
-            "name": f"layer_{i}",
-            "dtype": type(item).__name__,
-            "shape": [],
-        }
-        for i, item in enumerate(cache_items)
-    ]
-    payload_obj = {
-        "model_id": model_id,
-        "cached_tokens": cached_tokens,
-        "remaining_tokens": remaining_tokens,
-        "cache_repr": [repr(item) for item in cache_items],
-    }
-    payload = json.dumps(payload_obj, separators=(",", ":"), default=str).encode(
-        "utf-8"
-    )
-    return payload, {
+
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        with mx.stream(mx.default_device()):
+            save_prompt_cache(
+                tmp_path,
+                cache_items,
+                metadata={
+                    "model_id": model_id,
+                    "cached_tokens": str(cached_tokens),
+                },
+            )
+        with open(tmp_path, "rb") as f:
+            payload_bytes = f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    tensors = []
+    for i, item in enumerate(cache_items):
+        keys = getattr(item, "keys", None)
+        dtype_name = str(getattr(keys, "dtype", type(item).__name__))
+        shape = list(getattr(keys, "shape", []) or [])
+        tensors.append({"name": f"layer_{i}", "dtype": dtype_name, "shape": shape})
+
+    return payload_bytes, {
         "n_tokens": max(cached_tokens, 0),
         "tensors": tensors,
-        "cache_class": "paged_ssd",
+        "cache_class": cache_items[0].__class__.__name__ if cache_items else "unknown",
     }
 
 
@@ -1171,24 +1187,37 @@ def _apply_slot_restore_payload(
     entry: Any, payload_bytes: bytes, manifest: SlotManifest
 ) -> int:
     """Apply restore payload using available runtime hooks."""
-    engine = getattr(entry, "engine", None)
-    if engine is not None:
-        engine_core = getattr(engine, "_engine", None)
-        scheduler = None
-        if engine_core is not None and getattr(engine_core, "engine", None) is not None:
-            scheduler = getattr(engine_core.engine, "scheduler", None)
-        if scheduler is not None:
-            restore_fn = getattr(scheduler, "restore_slot_payload", None)
-            if callable(restore_fn):
-                restored = restore_fn(payload_bytes, manifest)
-                return int(restored if restored is not None else manifest.n_tokens)
+    import mlx.core as mx
+    from mlx_lm.models.cache import load_prompt_cache
+    import tempfile
 
-    payload_obj = json.loads(payload_bytes.decode("utf-8"))
-    if not isinstance(payload_obj, dict):
-        raise RuntimeError("slot payload must be a JSON object")
-    n_from_payload = payload_obj.get("cached_tokens")
-    if isinstance(n_from_payload, int) and n_from_payload >= 0:
-        return n_from_payload
+    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
+        tmp.write(payload_bytes)
+        tmp_path = tmp.name
+    try:
+        with mx.stream(mx.default_device()):
+            result = load_prompt_cache(tmp_path, return_metadata=True)
+        if isinstance(result, tuple) and len(result) == 2:
+            cache, file_metadata = result
+        else:
+            cache, file_metadata = result, {}
+        _server_state._slot_v2a_last_loaded = {
+            "cache": cache,
+            "file_metadata": file_metadata,
+            "manifest": manifest,
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    if isinstance(file_metadata, dict):
+        cached_raw = file_metadata.get("cached_tokens")
+        if isinstance(cached_raw, int) and cached_raw >= 0:
+            return cached_raw
+        if isinstance(cached_raw, str) and cached_raw.isdigit():
+            return int(cached_raw)
     return int(manifest.n_tokens)
 
 
