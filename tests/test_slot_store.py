@@ -500,3 +500,47 @@ async def test_one_shot_bind_concurrent_consume_only_one_wins():
     )
     winners = [result for result in (first, second) if result is not None]
     assert winners == [bind]
+
+
+@pytest.mark.asyncio
+async def test_drain_clears_all_entries_returns_count():
+    table = OneShotBindTable()
+    for i in range(3):
+        await table.put(
+            OneShotBind(
+                model_id="m",
+                request_handle=f"h-{i}",
+                payload_bytes=b"abc",
+                manifest=_manifest(n_tokens=i + 1),
+                restore_epoch=f"epoch-{i}",
+            )
+        )
+
+    drained = await table.drain()
+
+    assert drained == 3
+    assert await table.consume_any("m", "h-0") is None
+    assert await table.consume_any("m", "h-1") is None
+    assert await table.consume_any("m", "h-2") is None
+
+
+@pytest.mark.asyncio
+async def test_drain_logs_each_dropped_entry(caplog):
+    table = OneShotBindTable()
+    for i in range(2):
+        await table.put(
+            OneShotBind(
+                model_id="m",
+                request_handle=f"h-{i}",
+                payload_bytes=b"abc",
+                manifest=_manifest(n_tokens=i + 1),
+                restore_epoch=f"epoch-{i}",
+            )
+        )
+
+    with caplog.at_level("INFO"):
+        drained = await table.drain()
+
+    assert drained == 2
+    events = [record.msg for record in caplog.records if "slot_apply_drain_on_disable" in str(record.msg)]
+    assert len(events) == 2

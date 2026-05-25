@@ -1496,6 +1496,98 @@ class TestSlotRestoreEndpoint:
             _server_state.slot_store = original_slot_store
             _server_state.one_shot_bind_table = original_bind_table
 
+    def test_v2_phase4a_restore_emits_slot_restore_parked_event(
+        self, tmp_path, mock_engine_pool, monkeypatch, caplog
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                lambda *args, **kwargs: (
+                    b"x",
+                    {
+                        "n_tokens": 123,
+                        "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                        "cache_class": "paged_ssd",
+                    },
+                ),
+            )
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 123)
+            client = TestClient(app)
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+            )
+            assert save_response.status_code == 200, save_response.text
+            with caplog.at_level("INFO"):
+                response = client.post(
+                    "/slots/0?action=restore",
+                    json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                )
+            assert response.status_code == 200, response.text
+            assert any("slot_restore_parked" in record.message for record in caplog.records)
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_phase4a_save_emits_slot_save_completed_event(
+        self, tmp_path, mock_engine_pool, monkeypatch, caplog
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                lambda *args, **kwargs: (
+                    b"x",
+                    {
+                        "n_tokens": 123,
+                        "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                        "cache_class": "paged_ssd",
+                    },
+                ),
+            )
+            client = TestClient(app)
+            with caplog.at_level("INFO"):
+                response = client.post(
+                    "/slots/0?action=save",
+                    json={"filename": "slot-roundtrip.safetensors", "model": "test-model"},
+                )
+            assert response.status_code == 200, response.text
+            assert any("slot_save_completed" in record.message for record in caplog.records)
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
     def test_v2_phase1a_restore_accepts_request_handle(
         self, tmp_path, mock_engine_pool, monkeypatch
     ):

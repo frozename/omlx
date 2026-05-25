@@ -3301,6 +3301,13 @@ class Scheduler:
             return False
 
         if not request.x_omlx_restore_epoch:
+            logger.info(
+                "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
+                request.x_omlx_model_id or (_server_state.default_model or ""),
+                request_handle,
+                "<required>",
+                None,
+            )
             raise SlotApplyEpochMismatch(
                 model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
                 request_handle=request_handle,
@@ -3330,11 +3337,23 @@ class Scheduler:
                 break
 
         if bind is None:
+            logger.info(
+                "[slot_apply_miss_handle_not_found] model_id=%s request_handle=%s",
+                request.x_omlx_model_id or (_server_state.default_model or ""),
+                request_handle,
+            )
             raise SlotApplyHandleNotFound(
                 model_id=request.x_omlx_model_id or (_server_state.default_model or ""),
                 request_handle=request_handle,
             )
         if request.x_omlx_restore_epoch != bind.restore_epoch:
+            logger.info(
+                "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
+                model_id or bind.model_id,
+                request_handle,
+                bind.restore_epoch,
+                request.x_omlx_restore_epoch,
+            )
             raise SlotApplyEpochMismatch(
                 model_id=model_id or bind.model_id,
                 request_handle=request_handle,
@@ -3352,6 +3371,14 @@ class Scheduler:
                 current_ctx_size=current_ctx_size,
             )
         except SlotGuardMismatch as exc:
+            logger.info(
+                "[slot_apply_miss_guard_mismatch] model_id=%s request_handle=%s field=%s expected=%s observed=%s",
+                bind.model_id,
+                request_handle,
+                exc.field,
+                exc.expected,
+                exc.observed,
+            )
             raise SlotApplyGuardMismatch(
                 field=exc.field,
                 expected=exc.expected,
@@ -3368,6 +3395,13 @@ class Scheduler:
         capped = min(request.cached_tokens, len(request.prompt_token_ids or []))
         request.cached_tokens = capped
         request.remaining_tokens = (request.prompt_token_ids or [])[capped:]
+        logger.info(
+            "[slot_apply_success] model_id=%s request_handle=%s restore_epoch=%s n_tokens_applied=%s",
+            bind.model_id,
+            request_handle,
+            bind.restore_epoch,
+            request.cached_tokens,
+        )
         return True
 
     def add_request(self, request: Request) -> None:

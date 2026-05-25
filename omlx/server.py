@@ -1423,6 +1423,9 @@ def init_server(
         _server_state.one_shot_bind_table = OneShotBindTable()
         logger.info("Slot API enabled at %s", slot_path)
     else:
+        if _server_state.one_shot_bind_table is not None:
+            # Drain parked binds from a previous slot-enabled init before disabling.
+            asyncio.run(_server_state.one_shot_bind_table.drain())
         _server_state.slot_store = None
         _server_state.one_shot_bind_table = None
 
@@ -2063,6 +2066,13 @@ async def slot_action(
                     manifest,
                 )
                 restore_epoch = uuid.uuid4().hex
+                logger.info(
+                    "[slot_restore_parked] model_id=%s request_handle=%s restore_epoch=%s n_tokens=%s",
+                    resolved_model,
+                    request_handle,
+                    restore_epoch,
+                    n_restored,
+                )
                 bind = OneShotBind(
                     model_id=resolved_model,
                     request_handle=request_handle,
@@ -2188,6 +2198,12 @@ async def slot_action(
                 filename=filename,
                 payload=payload_bytes,
                 manifest=manifest,
+            )
+            logger.info(
+                "[slot_save_completed] model_id=%s request_handle=%s n_saved=%s",
+                resolved_model,
+                request_handle,
+                n_saved,
             )
     except SlotBusy as exc:
         raise HTTPException(

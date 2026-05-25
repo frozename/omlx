@@ -153,6 +153,23 @@ class OneShotBindTable:
         async with self._guard:
             return self._entries.pop(key, None)
 
+    async def drain(self) -> int:
+        """Clear all entries; log each as slot_apply_drain_on_disable. Returns count."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+        async with self._guard:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for bind in entries:
+            logger.info(
+                "[slot_apply_drain_on_disable] model_id=%s request_handle=%s restore_epoch=%s",
+                bind.model_id,
+                bind.request_handle,
+                bind.restore_epoch,
+            )
+        return len(entries)
+
 
 def _cheap_file_hash(path: Path, chunk_size: int = 1024 * 1024) -> str:
     """Compute a content hash with bounded cost for very large files."""
