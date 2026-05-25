@@ -50,6 +50,7 @@ from .slot_store import (
     SlotGuardMismatch,
     check_restore_guards,
     compute_model_fingerprint,
+    hash_prompt_token_prefix,
 )
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.proc_memory import get_phys_footprint
@@ -3396,6 +3397,42 @@ class Scheduler:
                 model_id=bind.model_id,
                 request_handle=request_handle,
             ) from exc
+
+        if int(bind.manifest.slot_format_version) >= 2:
+            expected_prefix_sha = bind.manifest.prompt_prefix_sha256
+            if not expected_prefix_sha:
+                raise SlotApplyGuardMismatch(
+                    field="prompt_prefix",
+                    expected="<present>",
+                    observed="<missing>",
+                    model_id=bind.model_id,
+                    request_handle=request_handle,
+                )
+            prompt_ids = list(request.prompt_token_ids or [])
+            prefix_len = max(0, int(bind.manifest.n_tokens))
+            actual_prefix_sha = hash_prompt_token_prefix(prompt_ids[:prefix_len])
+            if actual_prefix_sha != expected_prefix_sha:
+                logger.info(
+                    "[slot_apply_miss_guard_mismatch] model_id=%s request_handle=%s field=%s expected=%s observed=%s",
+                    bind.model_id,
+                    request_handle,
+                    "prompt_prefix",
+                    expected_prefix_sha,
+                    actual_prefix_sha,
+                )
+                raise SlotApplyGuardMismatch(
+                    field="prompt_prefix",
+                    expected=expected_prefix_sha,
+                    observed=actual_prefix_sha,
+                    model_id=bind.model_id,
+                    request_handle=request_handle,
+                )
+        elif int(bind.manifest.slot_format_version) == 1:
+            logger.warning(
+                "[slot_apply_legacy_no_prefix_guard] model_id=%s request_handle=%s",
+                bind.model_id,
+                request_handle,
+            )
 
         prompt_cache = self._deserialize_one_shot_bind_payload(bind.payload_bytes)
         request.prompt_cache = prompt_cache

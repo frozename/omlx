@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -115,6 +116,7 @@ class SlotManifest:
     tensors: list[dict[str, Any]]
     cache_class: str
     producer: dict[str, str]
+    prompt_prefix_sha256: str | None = None
 
 
 @dataclass
@@ -246,9 +248,20 @@ def _parse_manifest_dict(data: dict[str, Any]) -> SlotManifest:
             f"missing required manifest fields: {', '.join(sorted(missing))}"
         )
 
-    version = data["slot_format_version"]
-    if version != 1:
+    version = int(data["slot_format_version"])
+    if version not in (1, 2):
         raise SlotManifestInvalid(f"unsupported slot_format_version: {version}")
+
+    prompt_prefix_sha256: str | None = None
+    if version >= 2:
+        raw_prefix_sha = data.get("prompt_prefix_sha256")
+        if not isinstance(raw_prefix_sha, str):
+            raise SlotManifestInvalid(
+                "missing required manifest fields: prompt_prefix_sha256"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", raw_prefix_sha):
+            raise SlotManifestInvalid("invalid prompt_prefix_sha256 format")
+        prompt_prefix_sha256 = raw_prefix_sha
 
     try:
         return SlotManifest(
@@ -260,9 +273,21 @@ def _parse_manifest_dict(data: dict[str, Any]) -> SlotManifest:
             tensors=list(data["tensors"]),
             cache_class=str(data["cache_class"]),
             producer=dict(data["producer"]),
+            prompt_prefix_sha256=prompt_prefix_sha256,
         )
     except Exception as exc:  # pragma: no cover - defensive conversion errors
         raise SlotManifestInvalid(f"invalid manifest fields: {exc}") from exc
+
+
+def hash_prompt_token_prefix(prompt_token_ids: list[int]) -> str:
+    """Stable SHA-256 for token-prefix identity using little-endian int32 packing."""
+    try:
+        prefix_bytes = b"".join(
+            struct.pack("<i", int(token_id)) for token_id in prompt_token_ids
+        )
+    except Exception as exc:
+        raise ValueError(f"invalid prompt token sequence: {exc}") from exc
+    return hashlib.sha256(prefix_bytes).hexdigest()
 
 
 def check_restore_guards(

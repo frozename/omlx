@@ -185,6 +185,7 @@ from .slot_store import (
     SlotStore,
     check_restore_guards,
     compute_model_fingerprint,
+    hash_prompt_token_prefix,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -1155,8 +1156,17 @@ def _is_slot_generating(model_id: str) -> bool:
     return False
 
 
-def _extract_slot_request_payload(entry) -> tuple[Any, int, list[int] | None]:
-    """Extract cache-bearing request state from the scheduler surface."""
+def _extract_slot_request_payload(
+    entry,
+    model_id: str | None = None,
+    prompt_token_ids: list[int] | None = None,
+) -> tuple[Any, int, list[int]]:
+    """Extract cache-bearing state for slot save.
+
+    Reliable slot saves should pass ``prompt_token_ids`` from the just-completed
+    inference prompt so save can query ``BlockAwarePrefixCache`` directly.
+    Legacy behavior (no prompt tokens) falls back to scanning active requests.
+    """
     engine = getattr(entry, "engine", None)
     if engine is None:
         raise RuntimeError("model engine is not loaded")
@@ -1167,6 +1177,46 @@ def _extract_slot_request_payload(entry) -> tuple[Any, int, list[int] | None]:
         scheduler = getattr(engine_core.engine, "scheduler", None)
     if scheduler is None:
         raise RuntimeError("scheduler is unavailable")
+
+    if prompt_token_ids is not None:
+        cache_manager = getattr(scheduler, "block_aware_cache", None)
+        if cache_manager is None:
+            raise RuntimeError("no cache state available for slot save")
+
+        if not model_id:
+            raise RuntimeError("model id is required for prompt-token slot save")
+
+        fetch_cache = getattr(cache_manager, "fetch_cache", None)
+        reconstruct_cache = getattr(cache_manager, "reconstruct_cache", None)
+        if not callable(fetch_cache) or not callable(reconstruct_cache):
+            raise RuntimeError("no cache state available for slot save")
+
+        save_lookup_id = f"slot-save-{model_id}-{uuid.uuid4().hex}"
+        block_table = None
+        try:
+            block_table, _remaining = fetch_cache(save_lookup_id, list(prompt_token_ids))
+            if block_table is None:
+                raise RuntimeError("no cache state available for slot save")
+
+            cache = reconstruct_cache(block_table)
+            if cache is None:
+                raise RuntimeError("no cache state available for slot save")
+
+            num_cached_tokens = max(0, int(getattr(block_table, "num_tokens", 0)))
+            token_prefix = list(prompt_token_ids[:num_cached_tokens])
+            return cache, num_cached_tokens, token_prefix
+        finally:
+            try:
+                paged_cache = getattr(cache_manager, "paged_cache", None)
+                delete_block_table = (
+                    getattr(paged_cache, "delete_block_table", None)
+                    if paged_cache is not None
+                    else None
+                )
+                if callable(delete_block_table):
+                    delete_block_table(save_lookup_id)
+            except Exception:
+                logger.debug("Failed to clean temporary slot-save block table", exc_info=True)
 
     requests = []
     all_requests = getattr(scheduler, "requests", None)
@@ -1189,19 +1239,34 @@ def _extract_slot_request_payload(entry) -> tuple[Any, int, list[int] | None]:
             cache = getattr(req, "_extracted_cache", None)
         if cache is not None:
             cached_tokens = int(getattr(req, "cached_tokens", 0) or 0)
-            remaining_tokens = getattr(req, "remaining_tokens", None)
-            return cache, cached_tokens, remaining_tokens
+            req_prompt_tokens = getattr(req, "prompt_token_ids", None)
+            if isinstance(req_prompt_tokens, list):
+                token_prefix = list(req_prompt_tokens[: max(0, cached_tokens)])
+            else:
+                token_prefix = []
+            return cache, cached_tokens, token_prefix
 
     raise RuntimeError("no cache state available for slot save")
 
 
-def _serialize_slot_payload(entry, model_id: str) -> tuple[bytes, dict[str, Any]]:
+def _serialize_slot_payload(
+    entry,
+    model_id: str,
+    prompt_token_ids: list[int] | None = None,
+) -> tuple[bytes, dict[str, Any]]:
     """Serialize slot payload into bytes plus metadata for the manifest."""
     import mlx.core as mx
     from mlx_lm.models.cache import save_prompt_cache
     import tempfile
 
-    cache, cached_tokens, _remaining_tokens = _extract_slot_request_payload(entry)
+    if prompt_token_ids is None:
+        cache, cached_tokens, token_prefix = _extract_slot_request_payload(entry)
+    else:
+        cache, cached_tokens, token_prefix = _extract_slot_request_payload(
+            entry,
+            model_id=model_id,
+            prompt_token_ids=prompt_token_ids,
+        )
     cache_items = list(cache) if isinstance(cache, (list, tuple)) else [cache]
 
     with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
@@ -1231,11 +1296,14 @@ def _serialize_slot_payload(entry, model_id: str) -> tuple[bytes, dict[str, Any]
         shape = list(getattr(keys, "shape", []) or [])
         tensors.append({"name": f"layer_{i}", "dtype": dtype_name, "shape": shape})
 
-    return payload_bytes, {
+    metadata = {
         "n_tokens": max(cached_tokens, 0),
         "tensors": tensors,
         "cache_class": cache_items[0].__class__.__name__ if cache_items else "unknown",
     }
+    if prompt_token_ids is not None:
+        metadata["prompt_prefix_sha256"] = hash_prompt_token_prefix(token_prefix)
+    return payload_bytes, metadata
 
 
 def _slot_ctx_size_for_model(model_id: str) -> int:
@@ -2076,6 +2144,11 @@ async def slot_action(
     payload: dict[str, object] | None = None,
     _: bool = Depends(verify_api_key),
 ):
+    """Handle slot save/restore.
+
+    For reliable v2.5b saves, callers should include ``prompt_tokens`` in save
+    payloads so the server can bind slot contents to an explicit prompt prefix.
+    """
     if slot_id != 0:
         raise HTTPException(status_code=400, detail="Invalid slot id (must be 0)")
 
@@ -2116,6 +2189,17 @@ async def slot_action(
     request_handle, filename = _resolve_slot_request_handle_and_filename(
         slot_store, payload, slot_id
     )
+    raw_prompt_tokens = payload.get("prompt_tokens")
+    prompt_tokens: list[int] | None = None
+    if raw_prompt_tokens is not None:
+        if not isinstance(raw_prompt_tokens, list):
+            raise HTTPException(status_code=400, detail="Invalid prompt_tokens")
+        parsed_tokens: list[int] = []
+        for token in raw_prompt_tokens:
+            if not isinstance(token, int) or isinstance(token, bool):
+                raise HTTPException(status_code=400, detail="Invalid prompt_tokens")
+            parsed_tokens.append(int(token))
+        prompt_tokens = parsed_tokens
 
     if action == "restore":
         if _is_slot_generating(resolved_model):
@@ -2261,14 +2345,21 @@ async def slot_action(
         async with slot_store.acquire_for_save(slot_id):
             entry = _slot_entry_for_model(resolved_model)
             payload_bytes, meta = await asyncio.to_thread(
-                _serialize_slot_payload, entry, resolved_model
+                _serialize_slot_payload,
+                entry,
+                resolved_model,
+                prompt_tokens,
             )
             model_fingerprint = await asyncio.to_thread(
                 compute_model_fingerprint,
                 Path(entry.model_path),
             )
+            prompt_prefix_sha256 = meta.get("prompt_prefix_sha256")
+            slot_format_version = (
+                2 if isinstance(prompt_prefix_sha256, str) and prompt_prefix_sha256 else 1
+            )
             manifest = SlotManifest(
-                slot_format_version=1,
+                slot_format_version=slot_format_version,
                 model_fingerprint=model_fingerprint,
                 model_id=resolved_model,
                 ctx_size=_slot_ctx_size_for_model(resolved_model),
@@ -2279,6 +2370,11 @@ async def slot_action(
                     "mlx_version": __version__,
                     "omlx_cache_format_version": "v1",
                 },
+                prompt_prefix_sha256=(
+                    str(prompt_prefix_sha256)
+                    if isinstance(prompt_prefix_sha256, str)
+                    else None
+                ),
             )
             n_saved = await slot_store.write_atomic(
                 slot_id=slot_id,

@@ -27,7 +27,12 @@ from omlx.mcp.types import MCPToolResult
 from omlx.settings import GlobalSettings
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler
-from omlx.slot_store import OneShotBind, OneShotBindTable, SlotManifest
+from omlx.slot_store import (
+    OneShotBind,
+    OneShotBindTable,
+    SlotManifest,
+    hash_prompt_token_prefix,
+)
 
 
 @dataclass
@@ -63,6 +68,79 @@ class MockGenerationOutput:
     finished: bool = True
     tool_calls: Optional[List[Dict[str, Any]]] = None
     cached_tokens: int = 0
+
+
+def _build_prefix_cache_backed_entry(
+    model_dir: Any,
+    *,
+    expected_tokens: list[int],
+    cached_tokens: int,
+):
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
+    class _BlockTable:
+        def __init__(self, n_tokens: int) -> None:
+            self.num_tokens = n_tokens
+            self.block_ids = [1]
+
+    class _PagedCache:
+        def __init__(self) -> None:
+            self.deleted_request_ids: list[str] = []
+
+        def delete_block_table(self, request_id: str) -> None:
+            self.deleted_request_ids.append(request_id)
+
+    class _PrefixCache:
+        def __init__(self) -> None:
+            self.fetch_calls: list[tuple[str, list[int]]] = []
+            self.paged_cache = _PagedCache()
+
+            cache = KVCache()
+            keys = mx.full((1, 1, max(cached_tokens, 1), 2), 1, dtype=mx.float16)
+            values = mx.full((1, 1, max(cached_tokens, 1), 2), 2, dtype=mx.float16)
+            cache.update_and_fetch(keys, values)
+            self._cache_layers = [cache]
+
+        def fetch_cache(self, request_id: str, tokens: list[int]):
+            self.fetch_calls.append((request_id, list(tokens)))
+            if list(tokens) != list(expected_tokens):
+                return None, tokens
+            return _BlockTable(cached_tokens), tokens[cached_tokens:]
+
+        def reconstruct_cache(self, block_table):
+            del block_table
+            return self._cache_layers
+
+    class _Scheduler:
+        def __init__(self) -> None:
+            self.block_aware_cache = _PrefixCache()
+            self.requests = {}
+
+        def snapshot_for_admin(self):
+            return {"running_by_id": {}, "waiting": []}
+
+    class _InnerEngine:
+        def __init__(self) -> None:
+            self.scheduler = _Scheduler()
+
+    class _EngineCore:
+        def __init__(self) -> None:
+            self.engine = _InnerEngine()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self._engine = _EngineCore()
+
+    class _Entry:
+        def __init__(self) -> None:
+            self.model_path = str(model_dir)
+            self.engine = _Engine()
+            self.preserve_thinking_default = False
+
+    entry = _Entry()
+    prefix_cache = entry.engine._engine.engine.scheduler.block_aware_cache
+    return entry, prefix_cache
 
 
 class MockEmbeddingEngineImpl(EmbeddingEngine):
@@ -701,6 +779,174 @@ class TestSlotSaveEndpoint:
             assert body["model"] == "test-model"
             assert body["filename"] == "slot-return.kvslot"
             assert body["n_saved"] == 123
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_5b_save_with_explicit_prompt_tokens_uses_prefix_cache(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            prompt_tokens = [11, 22, 33, 44, 55]
+            entry, prefix_cache = _build_prefix_cache_backed_entry(
+                tmp_path / "model-artifacts",
+                expected_tokens=prompt_tokens,
+                cached_tokens=3,
+            )
+            mock_engine_pool.get_entry = lambda model_id: entry
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                lambda entry_arg, model_arg, prompt_token_ids=None: (
+                    b"payload",
+                    {
+                        "n_tokens": 3,
+                        "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                        "cache_class": "paged_ssd",
+                        "prompt_prefix_sha256": (
+                            hash_prompt_token_prefix(prompt_token_ids[:3])
+                            if prompt_token_ids is not None
+                            else None
+                        ),
+                    },
+                ),
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={
+                    "model": "test-model",
+                    "request_handle": "prefix-a",
+                    "prompt_tokens": prompt_tokens,
+                },
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["n_saved"] == 3
+            # Ensure prompt_tokens path went through extraction by invoking it directly.
+            _, extracted_n_tokens, extracted_prefix = server_module._extract_slot_request_payload(
+                entry,
+                model_id="test-model",
+                prompt_token_ids=prompt_tokens,
+            )
+            assert extracted_n_tokens == 3
+            assert extracted_prefix == prompt_tokens[:3]
+            assert len(prefix_cache.fetch_calls) >= 1
+            assert prefix_cache.fetch_calls[0][1] == prompt_tokens
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_5b_save_writes_slot_format_version_2_when_prompt_tokens_provided(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            prompt_tokens = [101, 102, 103, 104]
+            entry, _prefix_cache = _build_prefix_cache_backed_entry(
+                tmp_path / "model-artifacts",
+                expected_tokens=prompt_tokens,
+                cached_tokens=3,
+            )
+            mock_engine_pool.get_entry = lambda model_id: entry
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                lambda entry_arg, model_arg, prompt_token_ids=None: (
+                    b"payload",
+                    {
+                        "n_tokens": 3,
+                        "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                        "cache_class": "paged_ssd",
+                        "prompt_prefix_sha256": hash_prompt_token_prefix(
+                            prompt_token_ids[:3]
+                        ),
+                    },
+                ),
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={
+                    "model": "test-model",
+                    "request_handle": "prefix-b",
+                    "prompt_tokens": prompt_tokens,
+                },
+            )
+            assert response.status_code == 200, response.text
+            manifest = json.loads(
+                (slot_dir / "prefix-b.kvslot.manifest.json").read_text(encoding="utf-8")
+            )
+            assert manifest["slot_format_version"] == 2
+            assert manifest["prompt_prefix_sha256"] == hash_prompt_token_prefix(
+                prompt_tokens[:3]
+            )
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_v2_5b_save_legacy_path_without_prompt_tokens_writes_format_version_1(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"model": "test-model", "request_handle": "legacy-b"},
+            )
+            assert response.status_code == 200, response.text
+            manifest = json.loads(
+                (slot_dir / "legacy-b.kvslot.manifest.json").read_text(encoding="utf-8")
+            )
+            assert manifest["slot_format_version"] == 1
+            assert manifest.get("prompt_prefix_sha256") is None
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
@@ -1811,6 +2057,142 @@ class TestSlotRestoreEndpoint:
             assert response.status_code == 200, response.text
             body = response.json()
             assert body["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+            _server_state.one_shot_bind_table = original_bind_table
+
+    def test_v2_5b_full_round_trip_with_prefix_guard(
+        self, tmp_path, mock_engine_pool, mock_llm_engine, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        original_bind_table = getattr(_server_state, "one_shot_bind_table", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            matching_prompt = [1, 2, 3, 4, 5, 6]
+            mismatched_prompt = [9, 9, 9, 4, 5, 6]
+            entry, _prefix_cache = _build_prefix_cache_backed_entry(
+                tmp_path / "model-artifacts",
+                expected_tokens=matching_prompt,
+                cached_tokens=3,
+            )
+            mock_engine_pool.get_entry = lambda model_id: entry
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                lambda entry_arg, model_arg, prompt_token_ids=None: (
+                    b"payload",
+                    {
+                        "n_tokens": 3,
+                        "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                        "cache_class": "paged_ssd",
+                        "prompt_prefix_sha256": hash_prompt_token_prefix(
+                            prompt_token_ids[:3]
+                        ),
+                    },
+                ),
+            )
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 3)
+
+            scheduler = Scheduler(model=MagicMock(), tokenizer=MagicMock())
+
+            async def fake_chat(messages, **kwargs):
+                prompt = matching_prompt
+                if messages and "mismatch" in str(messages[0].get("content", "")):
+                    prompt = mismatched_prompt
+                req = Request(
+                    request_id="req-v25b",
+                    prompt=prompt,
+                    sampling_params=SamplingParams(max_tokens=16),
+                    x_omlx_request_handle=kwargs.get("x_omlx_request_handle"),
+                    x_omlx_restore_epoch=kwargs.get("x_omlx_restore_epoch"),
+                    x_omlx_model_id=kwargs.get("x_omlx_model_id"),
+                )
+                req.prompt_token_ids = list(prompt)
+                bind = _server_state.one_shot_bind_table._entries[("test-model", "roundtrip")]  # noqa: SLF001
+                scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+                scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
+                applied = await scheduler.try_apply_one_shot_bind(req)
+                return MockGenerationOutput(
+                    text="Chat response.",
+                    prompt_tokens=len(prompt),
+                    completion_tokens=2,
+                    finish_reason="stop",
+                    finished=True,
+                    cached_tokens=req.cached_tokens if applied else 0,
+                )
+
+            mock_llm_engine.chat = AsyncMock(side_effect=fake_chat)
+            client = TestClient(app)
+
+            save_response = client.post(
+                "/slots/0?action=save",
+                json={
+                    "model": "test-model",
+                    "request_handle": "roundtrip",
+                    "prompt_tokens": matching_prompt,
+                },
+            )
+            assert save_response.status_code == 200, save_response.text
+
+            restore_response = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert restore_response.status_code == 200
+            restore_body = restore_response.json()
+
+            matching_response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": restore_body["restore_epoch"],
+                },
+            )
+            assert matching_response.status_code == 200, matching_response.text
+            assert (
+                matching_response.json()["usage"]["prompt_tokens_details"]["cached_tokens"]
+                > 0
+            )
+
+            restore_response_2 = client.post(
+                "/slots/0?action=restore",
+                json={"model": "test-model", "request_handle": "roundtrip"},
+            )
+            assert restore_response_2.status_code == 200
+            restore_body_2 = restore_response_2.json()
+
+            mismatch_response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "mismatch"}],
+                    "x_omlx_request_handle": "roundtrip",
+                    "x_omlx_restore_epoch": restore_body_2["restore_epoch"],
+                },
+            )
+            assert mismatch_response.status_code == 409
+            detail = mismatch_response.json()["error"]
+            nested = detail.get("message") if isinstance(detail, dict) else None
+            if isinstance(nested, dict) and isinstance(nested.get("error"), dict):
+                detail = nested["error"]
+            assert detail["code"] == "slot_apply_guard_mismatch"
+            assert detail["details"]["field"] == "prompt_prefix"
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default

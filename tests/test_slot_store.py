@@ -17,6 +17,7 @@ from omlx.slot_store import (
     SlotStore,
     check_restore_guards,
     compute_model_fingerprint,
+    hash_prompt_token_prefix,
 )
 
 
@@ -63,9 +64,14 @@ def _build_slot_entry(prompt_cache, cached_tokens: int = 7):
     return _Entry()
 
 
-def _manifest(n_tokens: int = 3) -> SlotManifest:
+def _manifest(
+    n_tokens: int = 3,
+    *,
+    slot_format_version: int = 1,
+    prompt_prefix_sha256: str | None = None,
+) -> SlotManifest:
     return SlotManifest(
-        slot_format_version=1,
+        slot_format_version=slot_format_version,
         model_fingerprint="abc123",
         model_id="test-model",
         ctx_size=4096,
@@ -73,6 +79,7 @@ def _manifest(n_tokens: int = 3) -> SlotManifest:
         tensors=[{"name": "layer_0", "dtype": "f16", "shape": [1, 2, 3]}],
         cache_class="paged_ssd",
         producer={"mlx_version": "0.0.0", "omlx_cache_format_version": "v1"},
+        prompt_prefix_sha256=prompt_prefix_sha256,
     )
 
 
@@ -263,11 +270,46 @@ async def test_read_with_manifest_raises_on_unknown_major_version(tmp_path):
     store = SlotStore(tmp_path)
     (tmp_path / "slot-a.kvslot").write_bytes(b"payload")
     (tmp_path / "slot-a.kvslot.manifest.json").write_text(
-        '{"slot_format_version":2,"model_fingerprint":"abc","model_id":"m","ctx_size":1,"n_tokens":1,"tensors":[],"cache_class":"paged_ssd","producer":{"mlx_version":"0","omlx_cache_format_version":"v1"}}',
+        '{"slot_format_version":99,"model_fingerprint":"abc","model_id":"m","ctx_size":1,"n_tokens":1,"tensors":[],"cache_class":"paged_ssd","producer":{"mlx_version":"0","omlx_cache_format_version":"v1"}}',
         encoding="utf-8",
     )
     with pytest.raises(SlotManifestInvalid):
         await store.read_with_manifest(0, "slot-a.kvslot")
+
+
+@pytest.mark.asyncio
+async def test_slot_manifest_v2_includes_prompt_prefix_sha256(tmp_path):
+    store = SlotStore(tmp_path)
+    expected_sha = hash_prompt_token_prefix([1, 2, 3])
+    manifest = _manifest(
+        n_tokens=3,
+        slot_format_version=2,
+        prompt_prefix_sha256=expected_sha,
+    )
+    await store.write_atomic(
+        slot_id=0,
+        filename="slot-v2.kvslot",
+        payload=b"payload",
+        manifest=manifest,
+    )
+
+    _, read_manifest = await store.read_with_manifest(0, "slot-v2.kvslot")
+    assert read_manifest.slot_format_version == 2
+    assert read_manifest.prompt_prefix_sha256 == expected_sha
+
+
+@pytest.mark.asyncio
+async def test_slot_manifest_v1_back_compat_accepts_missing_prefix_sha(tmp_path):
+    store = SlotStore(tmp_path)
+    (tmp_path / "slot-v1.kvslot").write_bytes(b"payload")
+    (tmp_path / "slot-v1.kvslot.manifest.json").write_text(
+        '{"slot_format_version":1,"model_fingerprint":"abc","model_id":"m","ctx_size":1,"n_tokens":1,"tensors":[],"cache_class":"paged_ssd","producer":{"mlx_version":"0","omlx_cache_format_version":"v1"}}',
+        encoding="utf-8",
+    )
+
+    _payload, manifest = await store.read_with_manifest(0, "slot-v1.kvslot")
+    assert manifest.slot_format_version == 1
+    assert manifest.prompt_prefix_sha256 is None
 
 
 def test_check_restore_guards_fingerprint_mismatch_raises():

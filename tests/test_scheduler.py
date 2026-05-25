@@ -30,6 +30,7 @@ from omlx.slot_store import (
     SlotApplyGuardMismatch,
     SlotApplyHandleNotFound,
     SlotManifest,
+    hash_prompt_token_prefix,
 )
 
 
@@ -384,9 +385,16 @@ class TestSchedulerOneShotBindApply:
     """Tests for Scheduler.try_apply_one_shot_bind()."""
 
     @staticmethod
-    def _manifest(*, fingerprint: str = "fp-a", ctx_size: int = 32768, n_tokens: int = 5) -> SlotManifest:
+    def _manifest(
+        *,
+        fingerprint: str = "fp-a",
+        ctx_size: int = 32768,
+        n_tokens: int = 5,
+        slot_format_version: int = 1,
+        prompt_prefix_sha256: str | None = None,
+    ) -> SlotManifest:
         return SlotManifest(
-            slot_format_version=1,
+            slot_format_version=slot_format_version,
             model_fingerprint=fingerprint,
             model_id="test-model",
             ctx_size=ctx_size,
@@ -394,6 +402,7 @@ class TestSchedulerOneShotBindApply:
             tensors=[{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
             cache_class="paged_ssd",
             producer={"mlx_version": "0.0.0", "omlx_cache_format_version": "v1"},
+            prompt_prefix_sha256=prompt_prefix_sha256,
         )
 
     @pytest.mark.asyncio
@@ -702,6 +711,142 @@ class TestSchedulerOneShotBindApply:
                 await scheduler.try_apply_one_shot_bind(request)
             assert exc.value.field == "model_fingerprint"
             assert await table.consume_any("test-model", "handle-a") is None
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_raises_guard_mismatch_on_prompt_prefix_change(
+        self, mock_model, mock_tokenizer
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        expected_sha = hash_prompt_token_prefix([1, 2, 3])
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="handle-prefix",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(
+                    n_tokens=3,
+                    slot_format_version=2,
+                    prompt_prefix_sha256=expected_sha,
+                ),
+                restore_epoch="epoch-a",
+            )
+        )
+
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-prefix-miss",
+                prompt=[9, 9, 9, 4, 5],
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="handle-prefix",
+                x_omlx_restore_epoch="epoch-a",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = [9, 9, 9, 4, 5]
+
+            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
+
+            with pytest.raises(SlotApplyGuardMismatch) as exc:
+                await scheduler.try_apply_one_shot_bind(request)
+            assert exc.value.field == "prompt_prefix"
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_succeeds_when_prompt_prefix_matches(
+        self, mock_model, mock_tokenizer
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        prompt_tokens = [1, 2, 3, 4, 5]
+        expected_sha = hash_prompt_token_prefix(prompt_tokens[:3])
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="handle-prefix-ok",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(
+                    n_tokens=3,
+                    slot_format_version=2,
+                    prompt_prefix_sha256=expected_sha,
+                ),
+                restore_epoch="epoch-a",
+            )
+        )
+
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-prefix-ok",
+                prompt=prompt_tokens,
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="handle-prefix-ok",
+                x_omlx_restore_epoch="epoch-a",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = prompt_tokens
+
+            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
+
+            applied = await scheduler.try_apply_one_shot_bind(request)
+            assert applied is True
+            assert request.cached_tokens == 3
+            assert request.remaining_tokens == [4, 5]
+        finally:
+            server_module._server_state.one_shot_bind_table = original_table
+
+    @pytest.mark.asyncio
+    async def test_try_apply_one_shot_bind_legacy_v1_manifest_skips_prefix_check_with_warn_log(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        import omlx.server as server_module
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        table = OneShotBindTable()
+        await table.put(
+            OneShotBind(
+                model_id="test-model",
+                request_handle="legacy-v1",
+                payload_bytes=b"payload-a",
+                manifest=self._manifest(n_tokens=3, slot_format_version=1),
+                restore_epoch="epoch-a",
+            )
+        )
+
+        original_table = getattr(server_module._server_state, "one_shot_bind_table", None)
+        server_module._server_state.one_shot_bind_table = table
+        try:
+            request = Request(
+                request_id="req-v1-legacy",
+                prompt=[9, 9, 9, 4, 5],
+                sampling_params=SamplingParams(max_tokens=8),
+                x_omlx_request_handle="legacy-v1",
+                x_omlx_restore_epoch="epoch-a",
+                x_omlx_model_id="test-model",
+            )
+            request.prompt_token_ids = [9, 9, 9, 4, 5]
+
+            scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
+            scheduler._current_slot_restore_guards = lambda _model_id: ("fp-a", 32768)  # type: ignore[method-assign]
+
+            with caplog.at_level("WARNING"):
+                applied = await scheduler.try_apply_one_shot_bind(request)
+            assert applied is True
+            assert any(
+                "slot_apply_legacy_no_prefix_guard" in record.message
+                for record in caplog.records
+            )
         finally:
             server_module._server_state.one_shot_bind_table = original_table
 
