@@ -180,6 +180,24 @@ class TestSchedulerInitialization:
         assert scheduler.total_prompt_tokens == 0
         assert scheduler.total_completion_tokens == 0
 
+    def test_init_honors_configured_paged_cache_block_size(
+        self, mock_model, mock_tokenizer, tmp_path
+    ):
+        """Scheduler should pass configured block size to paged cache manager."""
+        config = SchedulerConfig(
+            paged_ssd_cache_dir=str(tmp_path / "cache"),
+            paged_cache_block_size=64,
+        )
+        with patch("omlx.scheduler.HAS_TIERED_CACHE", False):
+            scheduler = Scheduler(
+                model=mock_model,
+                tokenizer=mock_tokenizer,
+                config=config,
+            )
+
+        assert scheduler.paged_cache_manager is not None
+        assert scheduler.paged_cache_manager.block_size == 64
+
     def test_snapshot_for_admin_is_isolated_from_live_state(
         self, mock_model, mock_tokenizer
     ):

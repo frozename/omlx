@@ -252,6 +252,7 @@ class CacheSettings:
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    paged_cache_block_size: int = 256  # Tokens per paged-cache block
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
@@ -295,6 +296,7 @@ class CacheSettings:
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
+            "paged_cache_block_size": self.paged_cache_block_size,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
 
@@ -307,6 +309,7 @@ class CacheSettings:
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=data.get("hot_cache_max_size", "0"),
+            paged_cache_block_size=data.get("paged_cache_block_size", 256),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
 
@@ -876,6 +879,13 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_INITIAL_CACHE_BLOCKS value: {initial_blocks}"
                 )
+        if paged_block_size := os.getenv("OMLX_PAGED_CACHE_BLOCK_SIZE"):
+            try:
+                self.cache.paged_cache_block_size = int(paged_block_size)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_PAGED_CACHE_BLOCK_SIZE value: {paged_block_size}"
+                )
 
         # Auth settings
         if api_key := os.getenv("OMLX_API_KEY"):
@@ -965,6 +975,11 @@ class GlobalSettings:
             and args.initial_cache_blocks is not None
         ):
             self.cache.initial_cache_blocks = args.initial_cache_blocks
+        if (
+            hasattr(args, "paged_cache_block_size")
+            and args.paged_cache_block_size is not None
+        ):
+            self.cache.paged_cache_block_size = args.paged_cache_block_size
 
         # Auth settings
         if hasattr(args, "api_key") and args.api_key is not None:
@@ -1164,6 +1179,17 @@ class GlobalSettings:
                 f"Invalid initial_cache_blocks: "
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
             )
+        if self.cache.paged_cache_block_size <= 0:
+            errors.append(
+                "Invalid paged_cache_block_size: "
+                f"{self.cache.paged_cache_block_size} (must be > 0)"
+            )
+        elif self.cache.paged_cache_block_size < 16:
+            errors.append(
+                "Invalid paged_cache_block_size: "
+                f"{self.cache.paged_cache_block_size} "
+                "(--paged-cache-block-size must be >= 16)"
+            )
 
         # Sampling validation
         if self.sampling.max_tokens <= 0:
@@ -1251,6 +1277,7 @@ class GlobalSettings:
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             chunked_prefill=self.scheduler.chunked_prefill,
+            paged_cache_block_size=self.cache.paged_cache_block_size,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

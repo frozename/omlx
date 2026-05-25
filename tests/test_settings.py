@@ -302,6 +302,7 @@ class TestCacheSettings:
         assert settings.enabled is True
         assert settings.ssd_cache_dir is None
         assert settings.ssd_cache_max_size == "auto"
+        assert settings.paged_cache_block_size == 256
         assert settings.initial_cache_blocks == 256
 
     def test_get_ssd_cache_dir_default(self):
@@ -342,6 +343,7 @@ class TestCacheSettings:
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
+            "paged_cache_block_size": 256,
             "initial_cache_blocks": 256,
         }
 
@@ -366,6 +368,15 @@ class TestCacheSettings:
         }
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
+
+    def test_from_dict_with_paged_cache_block_size(self):
+        """Test creation from dictionary with paged_cache_block_size."""
+        data = {
+            "enabled": True,
+            "paged_cache_block_size": 384,
+        }
+        settings = CacheSettings.from_dict(data)
+        assert settings.paged_cache_block_size == 384
 
     def test_initial_cache_blocks_custom(self):
         """Test custom initial_cache_blocks value."""
@@ -1008,6 +1019,18 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("initial_cache_blocks" in e.lower() for e in errors)
 
+    def test_validate_invalid_paged_cache_block_size(self):
+        """Test validation catches invalid paged_cache_block_size."""
+        settings = GlobalSettings()
+        settings.cache.paged_cache_block_size = 0
+        errors = settings.validate()
+        assert any("paged_cache_block_size" in e.lower() for e in errors)
+
+        settings = GlobalSettings()
+        settings.cache.paged_cache_block_size = 8
+        errors = settings.validate()
+        assert any("paged_cache_block_size" in e.lower() for e in errors)
+
     def test_validate_multiple_errors(self):
         """Test validation returns multiple errors."""
         settings = GlobalSettings()
@@ -1119,6 +1142,17 @@ class TestGlobalSettings:
             ):
                 settings = GlobalSettings.load(base_path=tmpdir)
                 assert settings.cache.initial_cache_blocks == 16384
+
+    def test_env_override_paged_cache_block_size(self):
+        """Test environment variable override for paged_cache_block_size."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"OMLX_PAGED_CACHE_BLOCK_SIZE": "384"},
+                clear=False,
+            ):
+                settings = GlobalSettings.load(base_path=tmpdir)
+                assert settings.cache.paged_cache_block_size == 384
 
     def test_env_override_cache_enabled_values(self):
         """Test various values for OMLX_CACHE_ENABLED."""
@@ -1260,6 +1294,13 @@ class TestGlobalSettings:
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.cache.initial_cache_blocks == 4096
 
+    def test_cli_override_paged_cache_block_size(self):
+        """Test CLI override for paged_cache_block_size."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(paged_cache_block_size=384)
+            settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
+            assert settings.cache.paged_cache_block_size == 384
+
     def test_cli_override_mcp(self):
         """Test CLI override for MCP settings."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1360,6 +1401,14 @@ class TestGlobalSettings:
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.initial_cache_blocks == 8192
+
+    def test_to_scheduler_config_paged_cache_block_size(self):
+        """Test that paged_cache_block_size passes through to SchedulerConfig."""
+        settings = GlobalSettings()
+        settings.cache.paged_cache_block_size = 384
+
+        scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.paged_cache_block_size == 384
 
 
 class TestInitSettings:

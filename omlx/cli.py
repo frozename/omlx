@@ -53,6 +53,11 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "slot_save_path") and args.slot_save_path is not None:
         return True
+    if (
+        hasattr(args, "paged_cache_block_size")
+        and args.paged_cache_block_size is not None
+    ):
+        return True
     return False
 
 
@@ -619,6 +624,12 @@ Example directory structure:
         default=None,
         help="Number of cache blocks to pre-allocate at startup (default: 256). "
         "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
+    serve_parser.add_argument(
+        "--paged-cache-block-size",
+        type=int,
+        default=None,
+        help="Tokens per paged prefix-cache block (default: 256, minimum: 16).",
     )
 
     # MCP options

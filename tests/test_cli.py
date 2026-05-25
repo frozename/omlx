@@ -170,6 +170,7 @@ class TestServeCommandOptions:
         )
         assert "--paged-ssd-cache-dir" in result.stdout
         assert "--paged-ssd-cache-max-size" in result.stdout
+        assert "--paged-cache-block-size" in result.stdout
         assert "--no-cache" in result.stdout
 
     def test_serve_has_mcp_option(self):
@@ -396,6 +397,7 @@ class TestHasCliOverrides:
             "max_process_memory": None,
             "host": None,
             "log_level": None,
+            "paged_cache_block_size": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
