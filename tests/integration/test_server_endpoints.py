@@ -2080,8 +2080,8 @@ class TestSlotRestoreEndpoint:
                 )
                 req.prompt_token_ids = [1, 2, 3, 4, 5, 6, 7]
                 table = _server_state.one_shot_bind_table
-                key = ("test-model", req.x_omlx_request_handle)
-                bind = table._entries[key]  # noqa: SLF001
+                bind = await table.peek_any("test-model", req.x_omlx_request_handle)
+                assert bind is not None
                 scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
                 scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
                 applied = scheduler.try_apply_one_shot_bind(req)
@@ -2132,7 +2132,7 @@ class TestSlotRestoreEndpoint:
             _server_state.one_shot_bind_table = original_bind_table
 
     def test_v2_6a_real_impl_roundtrip_and_runtime_apply_error_envelope(
-        self, tmp_path, mock_engine_pool, mock_llm_engine
+        self, tmp_path, mock_engine_pool, mock_llm_engine, caplog
     ):
         import asyncio
         import os
@@ -2248,6 +2248,10 @@ class TestSlotRestoreEndpoint:
                     x_omlx_model_id=kwargs.get("x_omlx_model_id"),
                 )
                 req.prompt_token_ids = list(prompt_tokens + [99])
+                if req.x_omlx_restore_epoch == "epoch-bad":
+                    scheduler._deserialize_one_shot_bind_payload = lambda _payload: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                        RuntimeError("runtime-apply-inner-detail")
+                    )
                 applied = scheduler.try_apply_one_shot_bind(req)
                 return MockGenerationOutput(
                     text="Chat response.",
@@ -2297,15 +2301,16 @@ class TestSlotRestoreEndpoint:
                     )
                 )
             )
-            bad_response = client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "x_omlx_request_handle": "roundtrip",
-                    "x_omlx_restore_epoch": "epoch-bad",
-                },
-            )
+            with caplog.at_level("WARNING"):
+                bad_response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "x_omlx_request_handle": "roundtrip",
+                        "x_omlx_restore_epoch": "epoch-bad",
+                    },
+                )
             assert bad_response.status_code == 409, bad_response.text
             payload = bad_response.json()
             detail = None
@@ -2320,7 +2325,12 @@ class TestSlotRestoreEndpoint:
                     detail = nested["error"]
             assert isinstance(detail, dict)
             assert detail["code"] == "slot_apply_runtime_error"
-            assert detail["details"]["exception_type"]
+            assert detail["message"] == "slot apply failed"
+            assert detail["details"]["message"] == "slot apply failed"
+            assert detail["details"]["exception_type"] == "SlotApplyRuntimeError"
+            assert "runtime-apply-inner-detail" not in bad_response.text
+            assert "runtime-apply-inner-detail" in caplog.text
+            assert "correlation_id=roundtrip:epoch-bad" in caplog.text
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
@@ -2386,7 +2396,10 @@ class TestSlotRestoreEndpoint:
                     x_omlx_model_id=kwargs.get("x_omlx_model_id"),
                 )
                 req.prompt_token_ids = list(prompt)
-                bind = _server_state.one_shot_bind_table._entries[("test-model", "roundtrip")]  # noqa: SLF001
+                bind = await _server_state.one_shot_bind_table.peek_any(
+                    "test-model", "roundtrip"
+                )
+                assert bind is not None
                 scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
                 scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
                 applied = scheduler.try_apply_one_shot_bind(req)
@@ -2499,7 +2512,10 @@ class TestSlotRestoreEndpoint:
                 )
                 req.prompt_token_ids = [1, 2, 3]
                 scheduler._deserialize_one_shot_bind_payload = lambda _payload: ["cache-ok"]  # type: ignore[method-assign]
-                bind = _server_state.one_shot_bind_table._entries[("test-model", "roundtrip")]  # noqa: SLF001
+                bind = await _server_state.one_shot_bind_table.peek_any(
+                    "test-model", "roundtrip"
+                )
+                assert bind is not None
                 scheduler._current_slot_restore_guards = lambda _model_id: (bind.manifest.model_fingerprint, bind.manifest.ctx_size)  # type: ignore[method-assign]
                 scheduler.try_apply_one_shot_bind(req)
                 return MockGenerationOutput(text="unused")

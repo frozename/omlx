@@ -177,6 +177,7 @@ from .slot_store import (
     SlotApplyEpochMismatch,
     SlotApplyGuardMismatch,
     SlotApplyHandleNotFound,
+    SlotApplyRuntimeError,
     SlotBusy,
     SlotGuardMismatch,
     SlotManifest,
@@ -1413,22 +1414,31 @@ def _slot_apply_http_detail(
 
 
 def _sanitize_slot_apply_runtime_message(exc: Exception) -> str:
-    """Sanitize runtime exception text for slot-apply HTTP surfaces."""
-    message = str(exc).replace("\n", " ").replace("\r", " ").strip()
-    if not message:
-        message = "slot apply failed at runtime"
-    if len(message) > 300:
-        message = f"{message[:297]}..."
-    return message
+    """Return a fixed client-safe message for slot-apply runtime errors."""
+    del exc
+    return "slot apply failed"
 
 
-def _slot_apply_runtime_http_detail(exc: Exception) -> dict[str, Any]:
+def _slot_apply_runtime_http_detail(
+    exc: Exception,
+    *,
+    correlation_id: str,
+) -> dict[str, Any]:
+    message = _sanitize_slot_apply_runtime_message(exc)
+    logger.warning(
+        "[slot_apply_runtime_error] correlation_id=%s exception_type=%s exception=%s",
+        correlation_id,
+        exc.__class__.__name__,
+        str(exc),
+        exc_info=exc,
+    )
     return {
         "error": {
             "code": "slot_apply_runtime_error",
-            "message": _sanitize_slot_apply_runtime_message(exc),
+            "message": message,
             "details": {
                 "exception_type": exc.__class__.__name__,
+                "message": message,
             },
         }
     }
@@ -3158,13 +3168,25 @@ async def create_chat_completion(
             SlotApplyGuardMismatch,
         ) as exc:
             raise HTTPException(status_code=409, detail=_slot_apply_http_detail(exc))
-        except Exception as exc:
-            if request.x_omlx_request_handle is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=_slot_apply_runtime_http_detail(exc),
-                ) from exc
-            raise
+        except SlotApplyRuntimeError as exc:
+            if request.x_omlx_request_handle is None:
+                raise
+            correlation_id = (
+                getattr(http_request.state, "request_id", None)
+                or http_request.headers.get("x-request-id")
+                or http_request.headers.get("x-correlation-id")
+                or (
+                    f"{request.x_omlx_request_handle}:"
+                    f"{request.x_omlx_restore_epoch or '<none>'}"
+                )
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_slot_apply_runtime_http_detail(
+                    exc,
+                    correlation_id=correlation_id,
+                ),
+            ) from exc
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0

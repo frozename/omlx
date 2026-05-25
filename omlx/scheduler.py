@@ -48,6 +48,7 @@ from .slot_store import (
     SlotApplyEpochMismatch,
     SlotApplyGuardMismatch,
     SlotApplyHandleNotFound,
+    SlotApplyRuntimeError,
     SlotGuardMismatch,
     check_restore_guards,
     compute_model_fingerprint,
@@ -3354,156 +3355,164 @@ class Scheduler:
             return False
         default_model = self._get_default_model() or ""
 
-        if not request.x_omlx_restore_epoch:
-            logger.info(
-                "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
-                request.x_omlx_model_id or default_model,
-                request_handle,
-                "<required>",
-                None,
-            )
-            raise SlotApplyEpochMismatch(
-                model_id=request.x_omlx_model_id or default_model,
-                request_handle=request_handle,
-                expected_epoch="<required>",
-                observed_epoch=None,
-            )
-
-        model_candidates: list[str] = []
-        if request.x_omlx_model_id:
-            model_candidates.append(request.x_omlx_model_id)
-        if self.config.model_name:
-            model_candidates.append(self.config.model_name)
-            model_candidates.append(os.path.basename(self.config.model_name.rstrip("/")))
-        if default_model:
-            model_candidates.append(default_model)
-
-        seen: set[str] = set()
-        ordered_candidates: list[str] = []
-        bind = None
-        model_id = ""
-        for candidate in model_candidates:
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            ordered_candidates.append(candidate)
-            key = (candidate, request_handle)
-            parked = table._entries.get(key)  # noqa: SLF001
-            if parked is None:
-                continue
-            if parked.restore_epoch == request.x_omlx_restore_epoch:
-                bind = table._entries.pop(key, None)  # noqa: SLF001
-            if bind is not None:
-                model_id = candidate
-                break
-
-        if bind is None:
-            for candidate in ordered_candidates:
-                parked = table._entries.get((candidate, request_handle))  # noqa: SLF001
-                if parked is None:
-                    continue
+        try:
+            if not request.x_omlx_restore_epoch:
                 logger.info(
                     "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
-                    candidate or parked.model_id,
+                    request.x_omlx_model_id or default_model,
                     request_handle,
-                    parked.restore_epoch,
-                    request.x_omlx_restore_epoch,
+                    "<required>",
+                    None,
                 )
                 raise SlotApplyEpochMismatch(
-                    model_id=candidate or parked.model_id,
+                    model_id=request.x_omlx_model_id or default_model,
                     request_handle=request_handle,
-                    expected_epoch=parked.restore_epoch,
-                    observed_epoch=request.x_omlx_restore_epoch,
+                    expected_epoch="<required>",
+                    observed_epoch=None,
                 )
 
-            logger.info(
-                "[slot_apply_miss_handle_not_found] model_id=%s request_handle=%s",
-                request.x_omlx_model_id or default_model,
-                request_handle,
-            )
-            raise SlotApplyHandleNotFound(
-                model_id=request.x_omlx_model_id or default_model,
-                request_handle=request_handle,
-            )
+            model_candidates: list[str] = []
+            if request.x_omlx_model_id:
+                model_candidates.append(request.x_omlx_model_id)
+            if self.config.model_name:
+                model_candidates.append(self.config.model_name)
+                model_candidates.append(
+                    os.path.basename(self.config.model_name.rstrip("/"))
+                )
+            if default_model:
+                model_candidates.append(default_model)
 
-        try:
-            current_fingerprint, current_ctx_size = self._current_slot_restore_guards(
-                bind.model_id
-            )
-            check_restore_guards(
-                manifest=bind.manifest,
-                current_fingerprint=current_fingerprint,
-                current_ctx_size=current_ctx_size,
-            )
-        except SlotGuardMismatch as exc:
-            logger.info(
-                "[slot_apply_miss_guard_mismatch] model_id=%s request_handle=%s field=%s expected=%s observed=%s",
-                bind.model_id,
-                request_handle,
-                exc.field,
-                exc.expected,
-                exc.observed,
-            )
-            raise SlotApplyGuardMismatch(
-                field=exc.field,
-                expected=exc.expected,
-                observed=exc.observed,
-                model_id=bind.model_id,
-                request_handle=request_handle,
-            ) from exc
+            seen: set[str] = set()
+            ordered_candidates: list[str] = []
+            bind = None
+            for candidate in model_candidates:
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                ordered_candidates.append(candidate)
+                bind = table.consume_sync(
+                    candidate,
+                    request_handle,
+                    request.x_omlx_restore_epoch,
+                )
+                if bind is not None:
+                    break
 
-        if int(bind.manifest.slot_format_version) >= 2:
-            expected_prefix_sha = bind.manifest.prompt_prefix_sha256
-            if not expected_prefix_sha:
-                raise SlotApplyGuardMismatch(
-                    field="prompt_prefix",
-                    expected="<present>",
-                    observed="<missing>",
-                    model_id=bind.model_id,
+            if bind is None:
+                for candidate in ordered_candidates:
+                    parked = table.peek_sync(candidate, request_handle)
+                    if parked is None:
+                        continue
+                    logger.info(
+                        "[slot_apply_miss_epoch_mismatch] model_id=%s request_handle=%s expected_epoch=%s provided_epoch=%s",
+                        candidate or parked.model_id,
+                        request_handle,
+                        parked.restore_epoch,
+                        request.x_omlx_restore_epoch,
+                    )
+                    raise SlotApplyEpochMismatch(
+                        model_id=candidate or parked.model_id,
+                        request_handle=request_handle,
+                        expected_epoch=parked.restore_epoch,
+                        observed_epoch=request.x_omlx_restore_epoch,
+                    )
+
+                logger.info(
+                    "[slot_apply_miss_handle_not_found] model_id=%s request_handle=%s",
+                    request.x_omlx_model_id or default_model,
+                    request_handle,
+                )
+                raise SlotApplyHandleNotFound(
+                    model_id=request.x_omlx_model_id or default_model,
                     request_handle=request_handle,
                 )
-            prompt_ids = list(request.prompt_token_ids or [])
-            prefix_len = max(0, int(bind.manifest.n_tokens))
-            actual_prefix_sha = hash_prompt_token_prefix(prompt_ids[:prefix_len])
-            if actual_prefix_sha != expected_prefix_sha:
+
+            try:
+                current_fingerprint, current_ctx_size = self._current_slot_restore_guards(
+                    bind.model_id
+                )
+                check_restore_guards(
+                    manifest=bind.manifest,
+                    current_fingerprint=current_fingerprint,
+                    current_ctx_size=current_ctx_size,
+                )
+            except SlotGuardMismatch as exc:
                 logger.info(
                     "[slot_apply_miss_guard_mismatch] model_id=%s request_handle=%s field=%s expected=%s observed=%s",
                     bind.model_id,
                     request_handle,
-                    "prompt_prefix",
-                    expected_prefix_sha,
-                    actual_prefix_sha,
+                    exc.field,
+                    exc.expected,
+                    exc.observed,
                 )
                 raise SlotApplyGuardMismatch(
-                    field="prompt_prefix",
-                    expected=expected_prefix_sha,
-                    observed=actual_prefix_sha,
+                    field=exc.field,
+                    expected=exc.expected,
+                    observed=exc.observed,
                     model_id=bind.model_id,
                     request_handle=request_handle,
+                ) from exc
+
+            if int(bind.manifest.slot_format_version) >= 2:
+                expected_prefix_sha = bind.manifest.prompt_prefix_sha256
+                if not expected_prefix_sha:
+                    raise SlotApplyGuardMismatch(
+                        field="prompt_prefix",
+                        expected="<present>",
+                        observed="<missing>",
+                        model_id=bind.model_id,
+                        request_handle=request_handle,
+                    )
+                prompt_ids = list(request.prompt_token_ids or [])
+                prefix_len = max(0, int(bind.manifest.n_tokens))
+                actual_prefix_sha = hash_prompt_token_prefix(prompt_ids[:prefix_len])
+                if actual_prefix_sha != expected_prefix_sha:
+                    logger.info(
+                        "[slot_apply_miss_guard_mismatch] model_id=%s request_handle=%s field=%s expected=%s observed=%s",
+                        bind.model_id,
+                        request_handle,
+                        "prompt_prefix",
+                        expected_prefix_sha,
+                        actual_prefix_sha,
+                    )
+                    raise SlotApplyGuardMismatch(
+                        field="prompt_prefix",
+                        expected=expected_prefix_sha,
+                        observed=actual_prefix_sha,
+                        model_id=bind.model_id,
+                        request_handle=request_handle,
+                    )
+            elif int(bind.manifest.slot_format_version) == 1:
+                logger.warning(
+                    "[slot_apply_legacy_no_prefix_guard] model_id=%s request_handle=%s",
+                    bind.model_id,
+                    request_handle,
                 )
-        elif int(bind.manifest.slot_format_version) == 1:
-            logger.warning(
-                "[slot_apply_legacy_no_prefix_guard] model_id=%s request_handle=%s",
+
+            prompt_cache = self._deserialize_one_shot_bind_payload(bind.payload_bytes)
+            request.prompt_cache = prompt_cache
+            request.block_table = None
+            request.shared_prefix_blocks = 0
+            request.cached_tokens = max(0, int(bind.manifest.n_tokens))
+            capped = min(request.cached_tokens, len(request.prompt_token_ids or []))
+            request.cached_tokens = capped
+            request.remaining_tokens = (request.prompt_token_ids or [])[capped:]
+            logger.info(
+                "[slot_apply_success] model_id=%s request_handle=%s restore_epoch=%s n_tokens_applied=%s",
                 bind.model_id,
                 request_handle,
+                bind.restore_epoch,
+                request.cached_tokens,
             )
-
-        prompt_cache = self._deserialize_one_shot_bind_payload(bind.payload_bytes)
-        request.prompt_cache = prompt_cache
-        request.block_table = None
-        request.shared_prefix_blocks = 0
-        request.cached_tokens = max(0, int(bind.manifest.n_tokens))
-        capped = min(request.cached_tokens, len(request.prompt_token_ids or []))
-        request.cached_tokens = capped
-        request.remaining_tokens = (request.prompt_token_ids or [])[capped:]
-        logger.info(
-            "[slot_apply_success] model_id=%s request_handle=%s restore_epoch=%s n_tokens_applied=%s",
-            bind.model_id,
-            request_handle,
-            bind.restore_epoch,
-            request.cached_tokens,
-        )
-        return True
+            return True
+        except (
+            SlotApplyEpochMismatch,
+            SlotApplyHandleNotFound,
+            SlotApplyGuardMismatch,
+        ):
+            raise
+        except Exception as exc:
+            raise SlotApplyRuntimeError("slot apply failed") from exc
 
     def add_request(self, request: Request) -> None:
         """
