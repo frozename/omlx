@@ -7,6 +7,7 @@ to verify request/response formats without loading actual models.
 """
 
 import asyncio
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -694,6 +695,410 @@ class TestSlotSaveEndpoint:
             assert body["model"] == "test-model"
             assert body["filename"] == "slot-return.kvslot"
             assert body["n_saved"] == 123
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_busy_returns_409_not_423_when_state_is_restoring(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import _get_slot_store, _server_state, app
+        from omlx.slot_store import SlotState
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            _get_slot_store()
+            _server_state.slot_store._states[0] = SlotState.RESTORING  # noqa: SLF001
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot-while-restoring.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 409
+            assert response.json()["detail"]["error"]["code"] == "slot_busy"
+            assert response.json()["detail"]["error"]["state"] == "RESTORING"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+
+class TestSlotRestoreEndpoint:
+    def _configure_slot_runtime(self, server_state, slot_dir, pool, tmp_path) -> None:
+        model_dir = tmp_path / "model-artifacts"
+        model_dir.mkdir(exist_ok=True)
+        (model_dir / "config.json").write_text('{"model":"test-model"}', encoding="utf-8")
+
+        class _Entry:
+            def __init__(self, path):
+                self.model_path = str(path)
+                self.engine = None
+
+        entry = _Entry(model_dir)
+        pool.get_entry = lambda model_id: entry
+
+        settings = GlobalSettings()
+        settings.slot_save_path = str(slot_dir)
+        settings.scheduler.max_concurrent_requests = 1
+        server_state.global_settings = settings
+        server_state.engine_pool = pool
+        server_state.default_model = "test-model"
+        server_state.api_key = None
+
+    def _write_restore_files(self, slot_dir, filename, payload, manifest_dict):
+        (slot_dir / filename).write_bytes(payload)
+        (slot_dir / f"{filename}.manifest.json").write_text(
+            json.dumps(manifest_dict, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _manifest_dict(self, fingerprint: str, ctx_size: int, n_tokens: int = 17):
+        return {
+            "slot_format_version": 1,
+            "model_fingerprint": fingerprint,
+            "model_id": "test-model",
+            "ctx_size": ctx_size,
+            "n_tokens": n_tokens,
+            "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+            "cache_class": "paged_ssd",
+            "producer": {"mlx_version": "0.0.0", "omlx_cache_format_version": "v1"},
+        }
+
+    def test_restore_rejects_absolute_path(self, tmp_path, mock_engine_pool):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "/etc/passwd", "model": "test-model"},
+            )
+            assert response.status_code == 400
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_rejects_dotdot_traversal(self, tmp_path, mock_engine_pool):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "../escape.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 400
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_returns_404_when_file_missing(self, tmp_path, mock_engine_pool):
+        from omlx.server import _server_state, app
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "missing.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 404
+            assert response.json()["detail"]["error"]["code"] == "slot_file_not_found"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_busy_returns_423_when_generating(self, tmp_path, mock_engine_pool):
+        from omlx.server import _get_slot_store, _server_state, app
+        from omlx.slot_store import SlotState
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            _get_slot_store()
+            _server_state.slot_store._states[0] = SlotState.GENERATING  # noqa: SLF001
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "slot.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 423
+            detail = response.json()["detail"]
+            assert detail["error"]["code"] == "slot_busy_restore"
+            assert detail["error"]["state"] == "GENERATING"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_busy_returns_423_when_already_restoring(self, tmp_path, mock_engine_pool):
+        from omlx.server import _get_slot_store, _server_state, app
+        from omlx.slot_store import SlotState
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            _get_slot_store()
+            _server_state.slot_store._states[0] = SlotState.RESTORING  # noqa: SLF001
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "slot.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 423
+            detail = response.json()["detail"]
+            assert detail["error"]["code"] == "slot_busy_restore"
+            assert detail["error"]["state"] == "RESTORING"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_fingerprint_mismatch_returns_409_with_field(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+        from omlx.slot_store import compute_model_fingerprint
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            model_dir = tmp_path / "model-artifacts"
+            fingerprint = compute_model_fingerprint(model_dir)
+            manifest = self._manifest_dict(fingerprint="different", ctx_size=32768, n_tokens=5)
+            self._write_restore_files(slot_dir, "slot.kvslot", b"{}", manifest)
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 5)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "slot.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 409
+            detail = response.json()["detail"]["error"]
+            assert detail["code"] == "slot_guard_mismatch"
+            assert detail["details"]["field"] == "model_fingerprint"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_ctx_size_mismatch_returns_409(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+        from omlx.slot_store import compute_model_fingerprint
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            model_dir = tmp_path / "model-artifacts"
+            fingerprint = compute_model_fingerprint(model_dir)
+            manifest = self._manifest_dict(fingerprint=fingerprint, ctx_size=999, n_tokens=5)
+            self._write_restore_files(slot_dir, "slot.kvslot", b"{}", manifest)
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 5)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "slot.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 409
+            detail = response.json()["detail"]["error"]
+            assert detail["code"] == "slot_guard_mismatch"
+            assert detail["details"]["field"] == "ctx_size"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    @pytest.mark.asyncio
+    async def test_restore_event_loop_not_blocked(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        httpx = pytest.importorskip("httpx")
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+        from omlx.slot_store import compute_model_fingerprint
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            model_dir = tmp_path / "model-artifacts"
+            fingerprint = compute_model_fingerprint(model_dir)
+            manifest = self._manifest_dict(fingerprint=fingerprint, ctx_size=32768, n_tokens=5)
+            self._write_restore_files(
+                slot_dir,
+                "slot-large.kvslot",
+                b"x" * (100 * 1024 * 1024),
+                manifest,
+            )
+
+            def slow_apply(*args, **kwargs):
+                time.sleep(0.3)
+                return 5
+
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", slow_apply)
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                restore_task = asyncio.create_task(
+                    ac.post(
+                        "/slots/0?action=restore",
+                        json={"filename": "slot-large.kvslot", "model": "test-model"},
+                    )
+                )
+
+                await asyncio.sleep(0.02)
+                started = time.perf_counter()
+                health = await ac.get("/health")
+                elapsed = time.perf_counter() - started
+
+                assert health.status_code == 200
+                assert elapsed < 0.05
+
+                restore_resp = await restore_task
+                assert restore_resp.status_code == 200
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_restore_returns_n_restored_token_count(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import _server_state, app
+        from omlx.slot_store import compute_model_fingerprint
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            model_dir = tmp_path / "model-artifacts"
+            fingerprint = compute_model_fingerprint(model_dir)
+            manifest = self._manifest_dict(fingerprint=fingerprint, ctx_size=32768, n_tokens=123)
+            self._write_restore_files(slot_dir, "slot-roundtrip.kvslot", b"{}", manifest)
+            monkeypatch.setattr(server_module, "_apply_slot_restore_payload", lambda *args, **kwargs: 123)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=restore",
+                json={"filename": "slot-roundtrip.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["id_slot"] == 0
+            assert body["model"] == "test-model"
+            assert body["filename"] == "slot-roundtrip.kvslot"
+            assert body["n_restored"] == 123
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default

@@ -173,9 +173,12 @@ from .server_metrics import get_server_metrics, reset_server_metrics
 from .slot_store import (
     InvalidFilename,
     SlotBusy,
+    SlotGuardMismatch,
     SlotManifest,
+    SlotManifestInvalid,
     SlotState,
     SlotStore,
+    check_restore_guards,
     compute_model_fingerprint,
 )
 
@@ -1160,6 +1163,35 @@ def _serialize_slot_payload(entry, model_id: str) -> tuple[bytes, dict[str, Any]
     }
 
 
+def _slot_ctx_size_for_model(model_id: str) -> int:
+    return int(get_max_context_window(model_id) or 0)
+
+
+def _apply_slot_restore_payload(
+    entry: Any, payload_bytes: bytes, manifest: SlotManifest
+) -> int:
+    """Apply restore payload using available runtime hooks."""
+    engine = getattr(entry, "engine", None)
+    if engine is not None:
+        engine_core = getattr(engine, "_engine", None)
+        scheduler = None
+        if engine_core is not None and getattr(engine_core, "engine", None) is not None:
+            scheduler = getattr(engine_core.engine, "scheduler", None)
+        if scheduler is not None:
+            restore_fn = getattr(scheduler, "restore_slot_payload", None)
+            if callable(restore_fn):
+                restored = restore_fn(payload_bytes, manifest)
+                return int(restored if restored is not None else manifest.n_tokens)
+
+    payload_obj = json.loads(payload_bytes.decode("utf-8"))
+    if not isinstance(payload_obj, dict):
+        raise RuntimeError("slot payload must be a JSON object")
+    n_from_payload = payload_obj.get("cached_tokens")
+    if isinstance(n_from_payload, int) and n_from_payload >= 0:
+        return n_from_payload
+    return int(manifest.n_tokens)
+
+
 def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
@@ -1847,16 +1879,6 @@ async def slot_action(
     if action not in SLOT_ALLOWED_ACTIONS:
         raise HTTPException(status_code=400, detail="Invalid action")
 
-    if action == "restore":
-        return JSONResponse(
-            status_code=501,
-            content={
-                "error": "not_implemented",
-                "action": action,
-                "id_slot": slot_id,
-            },
-        )
-
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid request payload")
 
@@ -1886,6 +1908,114 @@ async def slot_action(
     except InvalidFilename as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    if action == "restore":
+        if _is_slot_generating(resolved_model):
+            raise HTTPException(
+                status_code=423,
+                detail={
+                    "error": {
+                        "code": "slot_busy_restore",
+                        "state": SlotState.GENERATING.value,
+                        "message": "slot is busy",
+                    }
+                },
+            )
+
+        try:
+            async with slot_store.acquire_for_restore(slot_id):
+                entry = _slot_entry_for_model(resolved_model)
+                payload_bytes, manifest = await slot_store.read_with_manifest(
+                    slot_id, filename
+                )
+                current_fingerprint = await asyncio.to_thread(
+                    compute_model_fingerprint,
+                    Path(entry.model_path),
+                )
+                current_ctx_size = _slot_ctx_size_for_model(resolved_model)
+                check_restore_guards(
+                    manifest=manifest,
+                    current_fingerprint=current_fingerprint,
+                    current_ctx_size=current_ctx_size,
+                )
+                n_restored = await asyncio.to_thread(
+                    _apply_slot_restore_payload,
+                    entry,
+                    payload_bytes,
+                    manifest,
+                )
+        except SlotBusy as exc:
+            raise HTTPException(
+                status_code=423,
+                detail={
+                    "error": {
+                        "code": "slot_busy_restore",
+                        "state": exc.state.value,
+                        "message": str(exc),
+                    }
+                },
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": {
+                        "code": "slot_file_not_found",
+                        "message": str(exc),
+                    }
+                },
+            )
+        except SlotManifestInvalid as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "code": "slot_manifest_invalid",
+                        "message": str(exc),
+                    }
+                },
+            )
+        except SlotGuardMismatch as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": {
+                        "code": "slot_guard_mismatch",
+                        "message": str(exc),
+                        "details": {
+                            "field": exc.field,
+                            "expected": exc.expected,
+                            "observed": exc.observed,
+                            "slot_id": slot_id,
+                            "filename": filename,
+                        },
+                    }
+                },
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "slot_restore_failed",
+                        "message": str(exc),
+                        "details": {
+                            "slot_id": slot_id,
+                            "filename": filename,
+                            "model": resolved_model,
+                        },
+                    }
+                },
+            )
+
+        return {
+            "id_slot": slot_id,
+            "model": resolved_model,
+            "filename": filename,
+            "n_restored": n_restored,
+        }
+
     if _is_slot_generating(resolved_model):
         raise HTTPException(
             status_code=409,
@@ -1912,7 +2042,7 @@ async def slot_action(
                 slot_format_version=1,
                 model_fingerprint=model_fingerprint,
                 model_id=resolved_model,
-                ctx_size=get_max_context_window(resolved_model) or 0,
+                ctx_size=_slot_ctx_size_for_model(resolved_model),
                 n_tokens=int(meta.get("n_tokens", 0)),
                 tensors=meta.get("tensors", []),
                 cache_class=str(meta.get("cache_class", "paged_ssd")),

@@ -34,6 +34,22 @@ class SlotBusy(RuntimeError):
         self.state = state
 
 
+class SlotManifestInvalid(ValueError):
+    """Raised when a slot manifest is malformed or incompatible."""
+
+
+class SlotGuardMismatch(RuntimeError):
+    """Raised when restore guards fail against current runtime."""
+
+    def __init__(self, field: str, expected: str, observed: str) -> None:
+        super().__init__(
+            f"restore guard mismatch for {field}: expected={expected} observed={observed}"
+        )
+        self.field = field
+        self.expected = expected
+        self.observed = observed
+
+
 @dataclass
 class SlotManifest:
     slot_format_version: int
@@ -96,6 +112,62 @@ def compute_model_fingerprint(model_path: Path) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _parse_manifest_dict(data: dict[str, Any]) -> SlotManifest:
+    required_fields = (
+        "slot_format_version",
+        "model_fingerprint",
+        "model_id",
+        "ctx_size",
+        "n_tokens",
+        "tensors",
+        "cache_class",
+        "producer",
+    )
+    missing = [field for field in required_fields if field not in data]
+    if missing:
+        raise SlotManifestInvalid(
+            f"missing required manifest fields: {', '.join(sorted(missing))}"
+        )
+
+    version = data["slot_format_version"]
+    if version != 1:
+        raise SlotManifestInvalid(f"unsupported slot_format_version: {version}")
+
+    try:
+        return SlotManifest(
+            slot_format_version=int(data["slot_format_version"]),
+            model_fingerprint=str(data["model_fingerprint"]),
+            model_id=str(data["model_id"]),
+            ctx_size=int(data["ctx_size"]),
+            n_tokens=int(data["n_tokens"]),
+            tensors=list(data["tensors"]),
+            cache_class=str(data["cache_class"]),
+            producer=dict(data["producer"]),
+        )
+    except Exception as exc:  # pragma: no cover - defensive conversion errors
+        raise SlotManifestInvalid(f"invalid manifest fields: {exc}") from exc
+
+
+def check_restore_guards(
+    manifest: SlotManifest,
+    current_fingerprint: str,
+    current_ctx_size: int,
+) -> None:
+    """Validate v1 restore guards (fingerprint + ctx size only)."""
+    if manifest.model_fingerprint != current_fingerprint:
+        raise SlotGuardMismatch(
+            field="model_fingerprint",
+            expected=manifest.model_fingerprint,
+            observed=current_fingerprint,
+        )
+    if int(manifest.ctx_size) != int(current_ctx_size):
+        raise SlotGuardMismatch(
+            field="ctx_size",
+            expected=str(manifest.ctx_size),
+            observed=str(current_ctx_size),
+        )
+
+
 class SlotStore:
     def __init__(self, slot_save_path: Path) -> None:
         self._slot_save_path = Path(slot_save_path).expanduser().resolve()
@@ -128,6 +200,19 @@ class SlotStore:
             if state is not SlotState.IDLE:
                 raise SlotBusy(state)
             self._states[slot_id] = SlotState.SAVING
+        try:
+            yield
+        finally:
+            async with self._state_guard:
+                self._states[slot_id] = SlotState.IDLE
+
+    @asynccontextmanager
+    async def acquire_for_restore(self, slot_id: int) -> AsyncIterator[None]:
+        async with self._state_guard:
+            state = self._states.get(slot_id, SlotState.IDLE)
+            if state is not SlotState.IDLE:
+                raise SlotBusy(state)
+            self._states[slot_id] = SlotState.RESTORING
         try:
             yield
         finally:
@@ -197,3 +282,29 @@ class SlotStore:
                 except OSError:
                     pass
             raise
+
+    async def read_with_manifest(
+        self, slot_id: int, filename: str
+    ) -> tuple[bytes, SlotManifest]:
+        del slot_id  # slot id is part of the caller contract, not file naming.
+        safe_name = self.validate_filename(filename)
+        return await asyncio.to_thread(self._read_with_manifest_sync, safe_name)
+
+    def _read_with_manifest_sync(self, filename: str) -> tuple[bytes, SlotManifest]:
+        payload_path = self._slot_save_path / filename
+        manifest_path = self._slot_save_path / f"{filename}.manifest.json"
+        if not payload_path.exists():
+            raise FileNotFoundError(f"slot payload not found: {filename}")
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"slot manifest not found: {filename}.manifest.json")
+
+        payload = payload_path.read_bytes()
+        try:
+            manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise SlotManifestInvalid(f"failed to parse manifest json: {exc}") from exc
+        if not isinstance(manifest_obj, dict):
+            raise SlotManifestInvalid("manifest root must be a JSON object")
+
+        manifest = _parse_manifest_dict(manifest_obj)
+        return payload, manifest
