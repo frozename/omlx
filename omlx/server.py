@@ -170,6 +170,14 @@ from .exceptions import (
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .slot_store import (
+    InvalidFilename,
+    SlotBusy,
+    SlotManifest,
+    SlotState,
+    SlotStore,
+    compute_model_fingerprint,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -230,9 +238,7 @@ class ServerState:
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
-    # Slot lifecycle state lives at the server boundary so slot HTTP handlers
-    # can enforce invariants before scheduler integration lands in Phase B.
-    slot_states: dict[int, str] = field(default_factory=lambda: {0: "IDLE"})
+    slot_store: Optional[SlotStore] = None
 
 
 # Global server state instance
@@ -269,17 +275,17 @@ def _slot_invariant_violation_reason() -> str | None:
     return None
 
 
-def _is_valid_slot_filename(filename: object) -> bool:
-    if not isinstance(filename, str) or not filename:
-        return False
-    path = Path(filename)
-    if path.is_absolute():
-        return False
-    if any(part == ".." for part in path.parts):
-        return False
-    if len(path.parts) != 1:
-        return False
-    return True
+def _get_slot_store() -> SlotStore:
+    settings = _server_state.global_settings
+    if settings is None or not getattr(settings, "slot_save_path", None):
+        raise HTTPException(status_code=404, detail="Slot API disabled")
+    slot_path = Path(settings.slot_save_path).expanduser().resolve()
+    if (
+        _server_state.slot_store is None
+        or _server_state.slot_store._slot_save_path != slot_path  # noqa: SLF001
+    ):
+        _server_state.slot_store = SlotStore(slot_path)
+    return _server_state.slot_store
 
 
 def get_mcp_manager():
@@ -1062,6 +1068,98 @@ def _get_ocr_defaults(model_id: str | None) -> dict | None:
     return None
 
 
+def _slot_entry_for_model(model_id: str):
+    pool = _server_state.engine_pool
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    entry = pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=400, detail="Invalid model")
+    return entry
+
+
+def _is_slot_generating(model_id: str) -> bool:
+    entry = _slot_entry_for_model(model_id)
+    engine = getattr(entry, "engine", None)
+    if engine is None:
+        return False
+    checker = getattr(engine, "has_active_requests", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    return False
+
+
+def _extract_slot_request_payload(entry) -> tuple[Any, int, list[int] | None]:
+    """Extract cache-bearing request state from the scheduler surface."""
+    engine = getattr(entry, "engine", None)
+    if engine is None:
+        raise RuntimeError("model engine is not loaded")
+
+    scheduler = None
+    engine_core = getattr(engine, "_engine", None)
+    if engine_core is not None and getattr(engine_core, "engine", None) is not None:
+        scheduler = getattr(engine_core.engine, "scheduler", None)
+    if scheduler is None:
+        raise RuntimeError("scheduler is unavailable")
+
+    requests = []
+    all_requests = getattr(scheduler, "requests", None)
+    if isinstance(all_requests, dict):
+        requests.extend(all_requests.values())
+
+    snapshot_reader = getattr(scheduler, "snapshot_for_admin", None)
+    if callable(snapshot_reader):
+        snapshot = snapshot_reader()
+        running = snapshot.get("running_by_id", {})
+        waiting = snapshot.get("waiting", [])
+        if isinstance(running, dict):
+            requests.extend(running.values())
+        if isinstance(waiting, list):
+            requests.extend(waiting)
+
+    for req in requests:
+        cache = getattr(req, "prompt_cache", None)
+        if cache is None:
+            cache = getattr(req, "_extracted_cache", None)
+        if cache is not None:
+            cached_tokens = int(getattr(req, "cached_tokens", 0) or 0)
+            remaining_tokens = getattr(req, "remaining_tokens", None)
+            return cache, cached_tokens, remaining_tokens
+
+    raise RuntimeError("no cache state available for slot save")
+
+
+def _serialize_slot_payload(entry, model_id: str) -> tuple[bytes, dict[str, Any]]:
+    """Serialize slot payload into bytes plus metadata for the manifest."""
+    cache, cached_tokens, remaining_tokens = _extract_slot_request_payload(entry)
+    cache_items = list(cache) if isinstance(cache, (list, tuple)) else [cache]
+    tensors = [
+        {
+            "name": f"layer_{i}",
+            "dtype": type(item).__name__,
+            "shape": [],
+        }
+        for i, item in enumerate(cache_items)
+    ]
+    payload_obj = {
+        "model_id": model_id,
+        "cached_tokens": cached_tokens,
+        "remaining_tokens": remaining_tokens,
+        "cache_repr": [repr(item) for item in cache_items],
+    }
+    payload = json.dumps(payload_obj, separators=(",", ":"), default=str).encode(
+        "utf-8"
+    )
+    return payload, {
+        "n_tokens": max(cached_tokens, 0),
+        "tensors": tensors,
+        "cache_class": "paged_ssd",
+    }
+
+
 def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
@@ -1171,10 +1269,11 @@ def init_server(
         logger.error("Slot API startup invariant violation: %s", violation)
         raise ValueError(violation)
     if _slot_runtime_enabled():
-        logger.warning(
-            "Slot API enabled at %s (Phase A skeleton; save/restore currently return 501)",
-            global_settings.slot_save_path,
-        )
+        slot_path = Path(global_settings.slot_save_path).expanduser().resolve()
+        _server_state.slot_store = SlotStore(slot_path)
+        logger.info("Slot API enabled at %s", slot_path)
+    else:
+        _server_state.slot_store = None
 
     response_state_dir = None
     if global_settings:
@@ -1733,7 +1832,7 @@ async def slot_action(
     _: bool = Depends(verify_api_key),
 ):
     if slot_id != 0:
-        raise HTTPException(status_code=404, detail="Slot not found")
+        raise HTTPException(status_code=400, detail="Invalid slot id (must be 0)")
 
     if not _slot_runtime_enabled():
         raise HTTPException(status_code=404, detail="Slot API disabled")
@@ -1748,19 +1847,121 @@ async def slot_action(
     if action not in SLOT_ALLOWED_ACTIONS:
         raise HTTPException(status_code=400, detail="Invalid action")
 
-    filename = payload.get("filename") if isinstance(payload, dict) else None
-    if not _is_valid_slot_filename(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    if action == "restore":
+        return JSONResponse(
+            status_code=501,
+            content={
+                "error": "not_implemented",
+                "action": action,
+                "id_slot": slot_id,
+            },
+        )
 
-    return JSONResponse(
-        status_code=501,
-        content={
-            "error": "not_implemented",
-            "action": action,
-            "id_slot": slot_id,
-            "filename": filename,
-        },
-    )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid request payload")
+
+    raw_model = payload.get("model")
+    if not isinstance(raw_model, str) or not raw_model.strip():
+        raise HTTPException(status_code=400, detail="Missing model")
+
+    try:
+        resolved_model = resolve_model_id(raw_model) or raw_model
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "slot_model_ambiguity",
+                    "message": str(exc),
+                }
+            },
+        )
+
+    slot_store = _get_slot_store()
+    raw_filename = payload.get("filename")
+    if not isinstance(raw_filename, str):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    try:
+        filename = slot_store.validate_filename(raw_filename)
+    except InvalidFilename as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if _is_slot_generating(resolved_model):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "slot_busy",
+                    "state": SlotState.GENERATING.value,
+                    "message": "slot is busy",
+                }
+            },
+        )
+
+    try:
+        async with slot_store.acquire_for_save(slot_id):
+            entry = _slot_entry_for_model(resolved_model)
+            payload_bytes, meta = await asyncio.to_thread(
+                _serialize_slot_payload, entry, resolved_model
+            )
+            model_fingerprint = await asyncio.to_thread(
+                compute_model_fingerprint,
+                Path(entry.model_path),
+            )
+            manifest = SlotManifest(
+                slot_format_version=1,
+                model_fingerprint=model_fingerprint,
+                model_id=resolved_model,
+                ctx_size=get_max_context_window(resolved_model) or 0,
+                n_tokens=int(meta.get("n_tokens", 0)),
+                tensors=meta.get("tensors", []),
+                cache_class=str(meta.get("cache_class", "paged_ssd")),
+                producer={
+                    "mlx_version": __version__,
+                    "omlx_cache_format_version": "v1",
+                },
+            )
+            n_saved = await slot_store.write_atomic(
+                slot_id=slot_id,
+                filename=filename,
+                payload=payload_bytes,
+                manifest=manifest,
+            )
+    except SlotBusy as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "code": "slot_busy",
+                    "state": exc.state.value,
+                    "message": str(exc),
+                }
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "slot_serialize_failed",
+                    "message": str(exc),
+                    "details": {
+                        "slot_id": slot_id,
+                        "filename": filename,
+                        "model": resolved_model,
+                    },
+                }
+            },
+        )
+
+    return {
+        "id_slot": slot_id,
+        "model": resolved_model,
+        "filename": filename,
+        "n_saved": n_saved,
+    }
 
 
 @app.get("/v1/models/status")

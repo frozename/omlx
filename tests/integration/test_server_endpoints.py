@@ -6,6 +6,9 @@ Tests the FastAPI endpoints using TestClient with mocked EnginePool and Engine
 to verify request/response formats without loading actual models.
 """
 
+import asyncio
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
@@ -19,6 +22,7 @@ from omlx.engine.base import BaseEngine
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 from omlx.mcp.types import MCPToolResult
+from omlx.settings import GlobalSettings
 
 
 @dataclass
@@ -342,6 +346,358 @@ def client(mock_engine_pool):
     _server_state.engine_pool = original_pool
     _server_state.default_model = original_default
 
+
+class TestSlotSaveEndpoint:
+    def _configure_slot_runtime(self, server_state, slot_dir, pool, tmp_path) -> None:
+        model_dir = tmp_path / "model-artifacts"
+        model_dir.mkdir(exist_ok=True)
+        (model_dir / "config.json").write_text('{"model":"test-model"}', encoding="utf-8")
+
+        class _Entry:
+            def __init__(self, path):
+                self.model_path = str(path)
+                self.engine = None
+
+        entry = _Entry(model_dir)
+        pool.get_entry = lambda model_id: entry
+
+        settings = GlobalSettings()
+        settings.slot_save_path = str(slot_dir)
+        settings.scheduler.max_concurrent_requests = 1
+        server_state.global_settings = settings
+        server_state.engine_pool = pool
+        server_state.default_model = "test-model"
+        server_state.api_key = None
+
+    def _patch_minimal_slot_payload(self, monkeypatch, payload_size: int = 8):
+        import omlx.server as server_module
+
+        def fake_serialize_slot_payload(*args, **kwargs):
+            return b"x" * payload_size, {
+                "n_tokens": 123,
+                "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1, 2]}],
+                "cache_class": "paged_ssd",
+            }
+
+        monkeypatch.setattr(
+            server_module,
+            "_serialize_slot_payload",
+            fake_serialize_slot_payload,
+        )
+
+    def test_save_rejects_absolute_path(self, tmp_path, mock_engine_pool, monkeypatch):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "/etc/passwd", "model": "test-model"},
+            )
+            assert response.status_code == 400
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_rejects_dotdot_traversal(self, tmp_path, mock_engine_pool, monkeypatch):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "../escape.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 400
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_rejects_missing_model(self, tmp_path, mock_engine_pool, monkeypatch):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot.kvslot"},
+            )
+            assert response.status_code == 400
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_returns_structured_500_on_serialize_failure(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+
+            def fail_serialize(*args, **kwargs):
+                raise RuntimeError("serialize boom")
+
+            monkeypatch.setattr(server_module, "_serialize_slot_payload", fail_serialize)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 500
+            body = response.json()
+            assert body["error"]["code"] == "slot_serialize_failed"
+            assert body["error"]["details"]["slot_id"] == 0
+            assert body["error"]["details"]["filename"] == "slot.kvslot"
+            assert body["error"]["details"]["model"] == "test-model"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_busy_returns_409_when_generating(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        from omlx.server import app, _server_state
+        from omlx.slot_store import SlotState
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            # Force runtime slot state into GENERATING before save request.
+            _server_state.slot_store._states[0] = SlotState.GENERATING  # noqa: SLF001
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 409
+            detail = response.json()["detail"]
+            assert detail["error"]["code"] == "slot_busy"
+            assert detail["error"]["state"] == "GENERATING"
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_busy_returns_409_when_already_saving(
+        self, tmp_path, mock_engine_pool, monkeypatch
+    ):
+        import omlx.server as server_module
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+
+            def slow_serialize_slot_payload(*args, **kwargs):
+                time.sleep(0.2)
+                return b"payload", {
+                    "n_tokens": 42,
+                    "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [1]}],
+                    "cache_class": "paged_ssd",
+                }
+
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                slow_serialize_slot_payload,
+            )
+
+            client = TestClient(app)
+            first_done = threading.Event()
+            first_resp = {}
+
+            def first_save():
+                first_resp["response"] = client.post(
+                    "/slots/0?action=save",
+                    json={"filename": "slot-a.kvslot", "model": "test-model"},
+                )
+                first_done.set()
+
+            t = threading.Thread(target=first_save, daemon=True)
+            t.start()
+            time.sleep(0.05)
+
+            second = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot-b.kvslot", "model": "test-model"},
+            )
+            assert second.status_code == 409
+            assert second.json()["detail"]["error"]["code"] == "slot_busy"
+
+            assert first_done.wait(timeout=1.0)
+            assert first_resp["response"].status_code == 200
+            t.join(timeout=1.0)
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    @pytest.mark.asyncio
+    async def test_save_event_loop_not_blocked(self, tmp_path, mock_engine_pool, monkeypatch):
+        httpx = pytest.importorskip("httpx")
+        import omlx.server as server_module
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+
+            def slow_large_payload(*args, **kwargs):
+                time.sleep(0.3)
+                return b"x" * (100 * 1024 * 1024), {
+                    "n_tokens": 100_000,
+                    "tensors": [{"name": "layer_0", "dtype": "f16", "shape": [100000]}],
+                    "cache_class": "paged_ssd",
+                }
+
+            monkeypatch.setattr(
+                server_module,
+                "_serialize_slot_payload",
+                slow_large_payload,
+            )
+
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                save_task = asyncio.create_task(
+                    ac.post(
+                        "/slots/0?action=save",
+                        json={"filename": "slot-large.kvslot", "model": "test-model"},
+                    )
+                )
+
+                await asyncio.sleep(0.02)
+                started = time.perf_counter()
+                health = await ac.get("/health")
+                elapsed = time.perf_counter() - started
+
+                assert health.status_code == 200
+                assert elapsed < 0.05
+
+                save_resp = await save_task
+                assert save_resp.status_code == 200
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
+
+    def test_save_returns_n_saved_token_count(self, tmp_path, mock_engine_pool, monkeypatch):
+        from omlx.server import app, _server_state
+
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir()
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_settings = _server_state.global_settings
+        original_api_key = _server_state.api_key
+        original_slot_store = getattr(_server_state, "slot_store", None)
+        try:
+            self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
+            self._patch_minimal_slot_payload(monkeypatch)
+            client = TestClient(app)
+
+            response = client.post(
+                "/slots/0?action=save",
+                json={"filename": "slot-return.kvslot", "model": "test-model"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["id_slot"] == 0
+            assert body["model"] == "test-model"
+            assert body["filename"] == "slot-return.kvslot"
+            assert body["n_saved"] == 123
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.global_settings = original_settings
+            _server_state.api_key = original_api_key
+            _server_state.slot_store = original_slot_store
 
 class TestHealthEndpoint:
     """Tests for the /health endpoint."""
