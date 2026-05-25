@@ -114,6 +114,10 @@ class SlotApplyRuntimeError(RuntimeError):
     """Raised for non-classified runtime failures during one-shot slot apply."""
 
 
+class SlotSaveRuntimeError(RuntimeError):
+    """Raised for non-classified runtime failures during slot save."""
+
+
 @dataclass
 class SlotManifest:
     slot_format_version: int

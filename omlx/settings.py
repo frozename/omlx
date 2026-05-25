@@ -1012,14 +1012,19 @@ class GlobalSettings:
         self.ensure_directories()
 
         settings_file = self.base_path / "settings.json"
+        model_data = self.model.to_dict()
+        cache_data = self.cache.to_dict()
+        # Do not persist launch-specific paths globally across runs.
+        model_data.pop("model_dirs", None)
+        model_data.pop("model_dir", None)
+        cache_data.pop("ssd_cache_dir", None)
         data = {
             "version": SETTINGS_VERSION,
             "server": self.server.to_dict(),
-            "model": self.model.to_dict(),
+            "model": model_data,
             "memory": self.memory.to_dict(),
             "scheduler": self.scheduler.to_dict(),
-            "slot_save_path": self.slot_save_path,
-            "cache": self.cache.to_dict(),
+            "cache": cache_data,
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),

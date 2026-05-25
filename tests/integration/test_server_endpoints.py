@@ -584,6 +584,8 @@ class TestSlotSaveEndpoint:
             assert response.status_code == 500
             body = response.json()
             assert body["error"]["code"] == "slot_serialize_failed"
+            assert body["error"]["message"] == "slot save failed"
+            assert body["error"]["details"]["exception_type"] == "RuntimeError"
             assert body["error"]["details"]["slot_id"] == 0
             assert body["error"]["details"]["filename"] == "slot.kvslot"
             assert body["error"]["details"]["model"] == "test-model"
@@ -3550,6 +3552,59 @@ class TestTokenCountEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "input_tokens" in data
+
+
+class TestTokenizeEndpoint:
+    """Tests for the /v1/tokenize endpoint."""
+
+    def test_tokenize_messages_applies_chat_template(self, client):
+        response = client.post(
+            "/v1/tokenize",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello world"}],
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["model"] == "test-model"
+        assert body["applied_chat_template"] is True
+        assert isinstance(body["token_ids"], list)
+        assert body["n_tokens"] == len(body["token_ids"])
+        assert body["n_tokens"] > 0
+
+    def test_tokenize_prompt_raw(self, client):
+        response = client.post(
+            "/v1/tokenize",
+            json={
+                "model": "test-model",
+                "prompt": "raw prompt tokens here",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["model"] == "test-model"
+        assert body["applied_chat_template"] is False
+        assert body["n_tokens"] == len(body["token_ids"])
+        assert body["n_tokens"] > 0
+
+    def test_tokenize_rejects_both_messages_and_prompt(self, client):
+        response = client.post(
+            "/v1/tokenize",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "prompt": "raw prompt",
+            },
+        )
+
+        assert response.status_code == 400
+        body = response.json()
+        assert (
+            body["error"]["message"]["error"]["code"] == "invalid_tokenize_payload"
+        )
 
 
 class TestMCPEndpoints:

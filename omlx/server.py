@@ -29,6 +29,7 @@ Usage:
 The server provides:
     - POST /v1/completions - Text completions
     - POST /v1/chat/completions - Chat completions
+    - POST /v1/tokenize - Tokenize text/messages with loaded model tokenizer
     - POST /v1/messages - Anthropic Messages API
     - POST /v1/responses - OpenAI Responses API (Codex compatibility)
     - GET /v1/models - List available models (with load status)
@@ -182,6 +183,7 @@ from .slot_store import (
     SlotGuardMismatch,
     SlotManifest,
     SlotManifestInvalid,
+    SlotSaveRuntimeError,
     SlotState,
     SlotStore,
     check_restore_guards,
@@ -2408,44 +2410,49 @@ async def slot_action(
     try:
         async with slot_store.acquire_for_save(slot_id):
             entry = _slot_entry_for_model(resolved_model)
-            payload_bytes, meta = await asyncio.to_thread(
-                _serialize_slot_payload,
-                entry,
-                resolved_model,
-                prompt_tokens,
-            )
-            model_fingerprint = await asyncio.to_thread(
-                compute_model_fingerprint,
-                Path(entry.model_path),
-            )
-            prompt_prefix_sha256 = meta.get("prompt_prefix_sha256")
-            slot_format_version = (
-                2 if isinstance(prompt_prefix_sha256, str) and prompt_prefix_sha256 else 1
-            )
-            manifest = SlotManifest(
-                slot_format_version=slot_format_version,
-                model_fingerprint=model_fingerprint,
-                model_id=resolved_model,
-                ctx_size=_slot_ctx_size_for_model(resolved_model),
-                n_tokens=int(meta.get("n_tokens", 0)),
-                tensors=meta.get("tensors", []),
-                cache_class=str(meta.get("cache_class", "paged_ssd")),
-                producer={
-                    "mlx_version": __version__,
-                    "omlx_cache_format_version": "v1",
-                },
-                prompt_prefix_sha256=(
-                    str(prompt_prefix_sha256)
-                    if isinstance(prompt_prefix_sha256, str)
-                    else None
-                ),
-            )
-            n_saved = await slot_store.write_atomic(
-                slot_id=slot_id,
-                filename=filename,
-                payload=payload_bytes,
-                manifest=manifest,
-            )
+            try:
+                payload_bytes, meta = await asyncio.to_thread(
+                    _serialize_slot_payload,
+                    entry,
+                    resolved_model,
+                    prompt_tokens,
+                )
+                model_fingerprint = await asyncio.to_thread(
+                    compute_model_fingerprint,
+                    Path(entry.model_path),
+                )
+                prompt_prefix_sha256 = meta.get("prompt_prefix_sha256")
+                slot_format_version = (
+                    2
+                    if isinstance(prompt_prefix_sha256, str) and prompt_prefix_sha256
+                    else 1
+                )
+                manifest = SlotManifest(
+                    slot_format_version=slot_format_version,
+                    model_fingerprint=model_fingerprint,
+                    model_id=resolved_model,
+                    ctx_size=_slot_ctx_size_for_model(resolved_model),
+                    n_tokens=int(meta.get("n_tokens", 0)),
+                    tensors=meta.get("tensors", []),
+                    cache_class=str(meta.get("cache_class", "paged_ssd")),
+                    producer={
+                        "mlx_version": __version__,
+                        "omlx_cache_format_version": "v1",
+                    },
+                    prompt_prefix_sha256=(
+                        str(prompt_prefix_sha256)
+                        if isinstance(prompt_prefix_sha256, str)
+                        else None
+                    ),
+                )
+                n_saved = await slot_store.write_atomic(
+                    slot_id=slot_id,
+                    filename=filename,
+                    payload=payload_bytes,
+                    manifest=manifest,
+                )
+            except Exception as save_exc:
+                raise SlotSaveRuntimeError("slot save failed") from save_exc
             logger.info(
                 "[slot_save_completed] model_id=%s request_handle=%s n_saved=%s",
                 resolved_model,
@@ -2465,14 +2472,25 @@ async def slot_action(
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except SlotSaveRuntimeError as exc:
+        cause = exc.__cause__
+        exception_type = cause.__class__.__name__ if cause is not None else exc.__class__.__name__
+        correlation_id = f"{slot_id}:{filename}"
+        logger.warning(
+            "[slot_save_runtime_error] correlation_id=%s exception_type=%s model_id=%s",
+            correlation_id,
+            exception_type,
+            resolved_model,
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=500,
             content={
                 "error": {
                     "code": "slot_serialize_failed",
-                    "message": str(exc),
+                    "message": "slot save failed",
                     "details": {
+                        "exception_type": exception_type,
                         "slot_id": slot_id,
                         "filename": filename,
                         "model": resolved_model,
@@ -4634,6 +4652,63 @@ async def count_anthropic_tokens(
     logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
     return TokenCountResponse(input_tokens=input_tokens)
+
+
+@app.post("/v1/tokenize")
+async def tokenize(
+    payload: dict[str, Any],
+    _: bool = Depends(verify_api_key),
+):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid request payload")
+
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail="Missing model")
+
+    has_messages = "messages" in payload and payload.get("messages") is not None
+    has_prompt = "prompt" in payload and payload.get("prompt") is not None
+    if has_messages == has_prompt:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": "invalid_tokenize_payload",
+                    "message": "exactly one of messages or prompt is required",
+                }
+            },
+        )
+
+    engine = await get_engine_for_model(model)
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(status_code=500, detail="Tokenizer unavailable")
+
+    if has_messages:
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            raise HTTPException(status_code=400, detail="Invalid messages")
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        raw_token_ids = tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
+        applied_chat_template = True
+    else:
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str):
+            raise HTTPException(status_code=400, detail="Invalid prompt")
+        raw_token_ids = tokenizer.encode(prompt)
+        applied_chat_template = False
+
+    token_ids = [int(token_id) for token_id in list(raw_token_ids)]
+    return {
+        "model": model,
+        "token_ids": token_ids,
+        "n_tokens": len(token_ids),
+        "applied_chat_template": applied_chat_template,
+    }
 
 
 # =============================================================================

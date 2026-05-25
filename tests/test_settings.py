@@ -824,6 +824,22 @@ class TestGlobalSettings:
             assert data["server"]["port"] == 9001
             assert data["auth"]["api_key"] == "saved-key"
 
+    def test_save_excludes_launch_specific_paths(self):
+        """Launch-specific paths must not persist globally across runs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.slot_save_path = "/tmp/slots"
+            settings.cache.ssd_cache_dir = "/tmp/cache"
+            settings.model.model_dirs = ["/tmp/models"]
+            settings.model.model_dir = "/tmp/models"
+            settings.save()
+
+            data = json.loads((Path(tmpdir) / "settings.json").read_text())
+            assert "slot_save_path" not in data
+            assert "model_dirs" not in data["model"]
+            assert "model_dir" not in data["model"]
+            assert "ssd_cache_dir" not in data["cache"]
+
     def test_save_and_load_cors_origins(self):
         """Test saving and loading cors_origins through settings file."""
         with tempfile.TemporaryDirectory() as tmpdir:
