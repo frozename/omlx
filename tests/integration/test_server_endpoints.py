@@ -526,6 +526,8 @@ class TestSlotSaveEndpoint:
         try:
             self._configure_slot_runtime(_server_state, slot_dir, mock_engine_pool, tmp_path)
             self._patch_minimal_slot_payload(monkeypatch)
+            from omlx.server import _get_slot_store
+            _get_slot_store()
             client = TestClient(app)
 
             # Force runtime slot state into GENERATING before save request.

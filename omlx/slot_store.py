@@ -100,17 +100,8 @@ class SlotStore:
     def __init__(self, slot_save_path: Path) -> None:
         self._slot_save_path = Path(slot_save_path).expanduser().resolve()
         self._slot_save_path.mkdir(parents=True, exist_ok=True)
-        self._locks: dict[int, asyncio.Lock] = {}
         self._states: dict[int, SlotState] = {}
-        self._locks_guard = asyncio.Lock()
-
-    async def _get_lock(self, slot_id: int) -> asyncio.Lock:
-        async with self._locks_guard:
-            lock = self._locks.get(slot_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._locks[slot_id] = lock
-            return lock
+        self._state_guard = asyncio.Lock()
 
     def validate_filename(self, raw: str) -> str:
         if not isinstance(raw, str):
@@ -132,15 +123,15 @@ class SlotStore:
 
     @asynccontextmanager
     async def acquire_for_save(self, slot_id: int) -> AsyncIterator[None]:
-        lock = await self._get_lock(slot_id)
-        async with lock:
+        async with self._state_guard:
             state = self._states.get(slot_id, SlotState.IDLE)
             if state is not SlotState.IDLE:
                 raise SlotBusy(state)
             self._states[slot_id] = SlotState.SAVING
-            try:
-                yield
-            finally:
+        try:
+            yield
+        finally:
+            async with self._state_guard:
                 self._states[slot_id] = SlotState.IDLE
 
     async def write_atomic(
