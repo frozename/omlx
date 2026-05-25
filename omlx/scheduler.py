@@ -11,6 +11,7 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import asyncio
 import concurrent.futures
 import copy
 import gc
