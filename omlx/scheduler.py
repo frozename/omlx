@@ -571,6 +571,16 @@ class SchedulerConfig:
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
 
+    # Per-model concurrency cap. Keys are matched against
+    # ``os.path.basename(model_name)`` so manifests can use the human-
+    # readable model id (e.g. "Qwen3-8B-MLX-4bit") without having to
+    # spell the full path. When a key is present, its value REPLACES
+    # ``max_num_seqs`` for the Scheduler instance dedicated to that
+    # model; when absent, ``max_num_seqs`` is used as-is. Lets
+    # operators run e.g. mcr=4 on a 3B model alongside mcr=1 on an
+    # 8B on the same shared GPU.
+    per_model_max_concurrent: dict[str, int] = field(default_factory=dict)
+
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
@@ -699,6 +709,24 @@ class Scheduler:
         self._slot_ctx_size_fn = slot_ctx_size_fn
         self._one_shot_bind_table_getter = one_shot_bind_table_getter
         self._default_model_getter = default_model_getter
+
+        # Per-model concurrency override. Each Scheduler is dedicated to a
+        # single model_name; if an operator has configured a per-model cap
+        # for THIS model, replace max_num_seqs with it so admission honours
+        # the heterogeneous budget across co-resident models. Match by
+        # basename so manifests can use the model id (e.g. "Qwen3-8B-MLX-4bit")
+        # without spelling the full path. Falls back to max_num_seqs.
+        if self.config.per_model_max_concurrent and self.config.model_name:
+            model_id = os.path.basename(self.config.model_name.rstrip("/"))
+            override = self.config.per_model_max_concurrent.get(model_id)
+            if override is None:
+                # Also try the full model_name as a key for callers that
+                # set explicit fully-qualified entries.
+                override = self.config.per_model_max_concurrent.get(
+                    self.config.model_name
+                )
+            if isinstance(override, int) and override > 0:
+                self.config.max_num_seqs = override
 
         # Load additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
