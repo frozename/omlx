@@ -4660,10 +4660,14 @@ class Scheduler:
             # request is in flight.
             pressure_rejection: str | None = None
             if self._admission_paused and self.running:
-                pressure_rejection = (
-                    self._preflight_memory_check(request)
-                    or "admission paused by memory pressure"
-                )
+                # Refined per-request admission: when globally paused, a
+                # request is only rejected if its OWN preflight math says
+                # it won't fit. Requests that still fit under the current
+                # budget get admitted even while _admission_paused is set —
+                # the whole point of the per-request loop is to avoid
+                # head-of-line blocking the entire waiting deque when the
+                # head request is the only one that can't fit.
+                pressure_rejection = self._preflight_memory_check(request)
             elif (
                 self._prefill_memory_guard
                 and self._memory_limit_bytes > 0
@@ -5948,12 +5952,24 @@ class Scheduler:
                         except RuntimeError as cleanup_exc:
                             if not str(cleanup_exc).startswith("[METAL]"):
                                 raise
+                            # A second [METAL] error during victim teardown
+                            # means _cleanup_finished couldn't complete its
+                            # bookkeeping. Force a deterministic local
+                            # teardown so external state (victim emitted as
+                            # terminal) cannot diverge from internal state
+                            # (victim still in self.running). Without this
+                            # the next step would see the dead request as
+                            # live and try to schedule it again.
                             logger.warning(
                                 "Metal cascade during cleanup of victim %s; "
-                                "deferring to next step (error: %s)",
+                                "forcing local teardown (error: %s)",
                                 victim_id,
                                 cleanup_exc,
                             )
+                            self.running.pop(victim_id, None)
+                            uid = self.request_id_to_uid.pop(victim_id, None)
+                            if uid is not None:
+                                self.uid_to_request_id.pop(uid, None)
                 else:
                     responses = []
                 # Drive vlm_mtp generators alongside BatchGenerator. Order
@@ -5965,8 +5981,14 @@ class Scheduler:
 
                 if responses:
                     outputs, finished_ids = self._process_batch_responses(responses)
-                    output.outputs = outputs
-                    output.finished_request_ids = finished_ids
+                    # Merge rather than replace: a prior Metal-recovery
+                    # branch in this same step may have already appended
+                    # a victim failure to output.outputs and added it to
+                    # output.finished_request_ids. Replacing here would
+                    # silently drop the victim's terminal error before
+                    # the engine emits it to the client.
+                    output.outputs.extend(outputs)
+                    output.finished_request_ids.update(finished_ids)
                     self._cleanup_finished(finished_ids)
 
                     # Periodic Metal allocator cleanup during long decodes.
