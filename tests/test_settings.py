@@ -217,6 +217,7 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
+        assert settings.max_completion_batch_size is None
 
     def test_custom_values(self):
         """Test custom values."""
@@ -229,6 +230,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
+            "max_completion_batch_size": None,
             "chunked_prefill": False,
         }
 
@@ -247,6 +249,47 @@ class TestSchedulerSettings:
         data = {"completion_batch_size": 32}
         settings = SchedulerSettings.from_dict(data)
         assert settings.max_concurrent_requests == 32
+
+    def test_max_completion_batch_size_round_trip(self):
+        """The new override field survives to_dict / from_dict."""
+        original = SchedulerSettings(
+            max_concurrent_requests=4, max_completion_batch_size=1
+        )
+        restored = SchedulerSettings.from_dict(original.to_dict())
+        assert restored.max_completion_batch_size == 1
+        assert restored.max_concurrent_requests == 4
+
+    def test_max_completion_batch_size_missing_key_migrates_to_none(self):
+        """Old configs without the new key load with the field unset."""
+        settings = SchedulerSettings.from_dict({"max_concurrent_requests": 8})
+        assert settings.max_completion_batch_size is None
+
+    def test_to_scheduler_config_falls_back_when_unset(self, tmp_path):
+        """to_scheduler_config uses max_concurrent_requests when override unset."""
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.scheduler.max_concurrent_requests = 4
+        settings.scheduler.max_completion_batch_size = None
+
+        config = settings.to_scheduler_config()
+        assert config.completion_batch_size == 4
+        assert config.max_num_seqs == 4
+
+    def test_to_scheduler_config_uses_override_when_set(self, tmp_path):
+        """When override is set, it caps decode fusion without touching admission."""
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.scheduler.max_concurrent_requests = 4
+        settings.scheduler.max_completion_batch_size = 1
+
+        config = settings.to_scheduler_config()
+        assert config.completion_batch_size == 1
+        assert config.max_num_seqs == 4
+
+    def test_cli_flag_overrides_settings(self, tmp_path):
+        """--max-completion-batch-size on the CLI lands in scheduler.max_completion_batch_size."""
+        settings = GlobalSettings(base_path=tmp_path)
+        args = Namespace(max_completion_batch_size=1, max_concurrent_requests=None)
+        settings._apply_cli_overrides(args)
+        assert settings.scheduler.max_completion_batch_size == 1
 
 
 class TestCacheSettings:
