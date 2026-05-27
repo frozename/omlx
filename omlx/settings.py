@@ -234,6 +234,20 @@ class SchedulerSettings:
     # operators run heterogeneous concurrency budgets across co-resident
     # models on a shared GPU (e.g. mcr=4 on a 3B + mcr=1 on an 8B).
     per_model_max_concurrent: dict[str, int] = field(default_factory=dict)
+    # Per-model overrides for `max_completion_batch_size` and
+    # `prefill_step_size`. Same keying contract as
+    # `per_model_max_concurrent`: model-id basename OR fully-qualified
+    # model_name. Models without an entry fall back to the global
+    # `max_completion_batch_size` (which itself defaults to
+    # `max_concurrent_requests` for back-compat) and the hardcoded
+    # `prefill_step_size=2048` respectively. Lets operators tune the
+    # batch-fusion ceiling and prefill chunk size per model — small
+    # models often saturate at larger batch sizes than 8B-class peers,
+    # and prefill chunk sweet-spots differ by model.
+    per_model_max_completion_batch_size: dict[str, int] = field(
+        default_factory=dict
+    )
+    per_model_prefill_step_size: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -255,11 +269,21 @@ class SchedulerSettings:
         per_model_typed: dict[str, int] = {
             str(k): int(v) for k, v in per_model.items()
         }
+        per_model_mcb = data.get("per_model_max_completion_batch_size") or {}
+        per_model_mcb_typed: dict[str, int] = {
+            str(k): int(v) for k, v in per_model_mcb.items()
+        }
+        per_model_pss = data.get("per_model_prefill_step_size") or {}
+        per_model_pss_typed: dict[str, int] = {
+            str(k): int(v) for k, v in per_model_pss.items()
+        }
         return cls(
             max_concurrent_requests=value,
             max_completion_batch_size=data.get("max_completion_batch_size"),
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             per_model_max_concurrent=per_model_typed,
+            per_model_max_completion_batch_size=per_model_mcb_typed,
+            per_model_prefill_step_size=per_model_pss_typed,
         )
 
 
@@ -1016,6 +1040,34 @@ class GlobalSettings:
                             f"{key!r} is not an integer: {value!r}"
                         ) from e
             self.scheduler.per_model_max_concurrent = parsed
+        for attr_name, flag_label in (
+            ("per_model_max_completion_batch_size", "--per-model-max-completion-batch-size"),
+            ("per_model_prefill_step_size", "--per-model-prefill-step-size"),
+        ):
+            if hasattr(args, attr_name) and getattr(args, attr_name) is not None:
+                raw = getattr(args, attr_name)
+                parsed_dict: dict[str, int] = {}
+                if isinstance(raw, dict):
+                    parsed_dict = {str(k): int(v) for k, v in raw.items()}
+                else:
+                    for pair in str(raw).split(","):
+                        if not pair.strip():
+                            continue
+                        if "=" not in pair:
+                            raise ValueError(
+                                f"{flag_label}: malformed pair "
+                                f"{pair!r}; expected key=value"
+                            )
+                        key, value_str = pair.split("=", 1)
+                        key = key.strip()
+                        try:
+                            parsed_dict[key] = int(value_str.strip())
+                        except ValueError as e:
+                            raise ValueError(
+                                f"{flag_label}: value for "
+                                f"{key!r} is not an integer: {value_str!r}"
+                            ) from e
+                setattr(self.scheduler, attr_name, parsed_dict)
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -1354,6 +1406,12 @@ class GlobalSettings:
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             per_model_max_concurrent=dict(self.scheduler.per_model_max_concurrent),
+            per_model_max_completion_batch_size=dict(
+                self.scheduler.per_model_max_completion_batch_size
+            ),
+            per_model_prefill_step_size=dict(
+                self.scheduler.per_model_prefill_step_size
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

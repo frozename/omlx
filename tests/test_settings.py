@@ -277,6 +277,8 @@ class TestSchedulerSettings:
             "max_completion_batch_size": None,
             "chunked_prefill": False,
             "per_model_max_concurrent": {},
+            "per_model_max_completion_batch_size": {},
+            "per_model_prefill_step_size": {},
         }
 
     def test_from_dict(self):
