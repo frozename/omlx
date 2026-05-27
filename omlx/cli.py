@@ -592,6 +592,8 @@ Example directory structure:
         type=str,
         default=None,
         help="Directory for slot save/restore snapshots (enables /slots API skeleton)",
+    )
+    serve_parser.add_argument(
         "--max-completion-batch-size",
         type=int,
         default=None,
