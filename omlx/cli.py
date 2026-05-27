@@ -592,6 +592,17 @@ Example directory structure:
         type=str,
         default=None,
         help="Directory for slot save/restore snapshots (enables /slots API skeleton)",
+        "--max-completion-batch-size",
+        type=int,
+        default=None,
+        help="Cap on sequences fused into a single decode step (mlx-lm "
+        "completion_batch_size). Defaults to --max-concurrent-requests "
+        "for back-compat. Set this BELOW --max-concurrent-requests to "
+        "decouple HTTP admission from GPU-layer batch fusion: requests "
+        "still queue at the HTTP layer while each Metal command buffer "
+        "encodes at most N sequences. Useful on small GPUs under "
+        "multi-model load where fused batches exceed the GPU watchdog "
+        "timeout.",
     )
 
     # paged SSD cache options

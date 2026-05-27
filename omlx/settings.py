@@ -219,6 +219,10 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_concurrent_requests: int = 8
+    # Optional cap on sequences fused into a single decode step. When None,
+    # decode fusion follows max_concurrent_requests; when set, it overrides
+    # only the decode-step batch size, leaving HTTP admission untouched.
+    max_completion_batch_size: int | None = None
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
     chunked_prefill: bool = False
@@ -240,6 +244,7 @@ class SchedulerSettings:
             value = 8
         return cls(
             max_concurrent_requests=value,
+            max_completion_batch_size=data.get("max_completion_batch_size"),
             chunked_prefill=bool(data.get("chunked_prefill", False)),
         )
 
@@ -963,6 +968,11 @@ class GlobalSettings:
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
         if hasattr(args, "slot_save_path") and args.slot_save_path is not None:
             self.slot_save_path = args.slot_save_path
+        if (
+            hasattr(args, "max_completion_batch_size")
+            and args.max_completion_batch_size is not None
+        ):
+            self.scheduler.max_completion_batch_size = args.max_completion_batch_size
 
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
@@ -1288,7 +1298,11 @@ class GlobalSettings:
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
-            completion_batch_size=self.scheduler.max_concurrent_requests,
+            completion_batch_size=(
+                self.scheduler.max_completion_batch_size
+                if self.scheduler.max_completion_batch_size is not None
+                else self.scheduler.max_concurrent_requests
+            ),
             chunked_prefill=self.scheduler.chunked_prefill,
             paged_cache_block_size=self.cache.paged_cache_block_size,
             initial_cache_blocks=self.cache.initial_cache_blocks,
