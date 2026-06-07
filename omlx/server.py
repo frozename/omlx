@@ -2288,6 +2288,10 @@ async def slot_capabilities(_: bool = Depends(verify_api_key)):
     slots = {"api_version": 0}
     if _slot_runtime_enabled():
         slots = {"api_version": 2, "supports_request_handle": True}
+        # Advertise save-by-handle independently from restore, only when enabled,
+        # so the proxy negotiates each capability separately (staged rollback).
+        if save_handle_enabled():
+            slots["supports_save_handle"] = True
     return {
         "slot_api_version": SLOT_API_VERSION,
         "actions": ["save", "restore"],

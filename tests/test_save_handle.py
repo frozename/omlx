@@ -112,3 +112,22 @@ def test_table_put_ignores_empty():
     t.put("", [1], "m")
     t.put("h", [], "m")
     assert len(t) == 0
+
+
+# --- Phase 4: capability advertisement (gated) ---
+
+
+def test_capability_bit_gated(monkeypatch):
+    import asyncio
+    from omlx import server as omlx_server
+
+    monkeypatch.setattr(omlx_server, "_slot_runtime_enabled", lambda: True)
+
+    monkeypatch.delenv("OMLX_SAVE_HANDLE_ENABLED", raising=False)
+    caps = asyncio.run(omlx_server.slot_capabilities(_=True))
+    assert "supports_save_handle" not in caps["slots"]  # dark by default
+
+    monkeypatch.setenv("OMLX_SAVE_HANDLE_ENABLED", "1")
+    caps = asyncio.run(omlx_server.slot_capabilities(_=True))
+    assert caps["slots"]["supports_save_handle"] is True
+    assert caps["slots"]["supports_request_handle"] is True  # independent of restore
