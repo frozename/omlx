@@ -23,6 +23,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 import mlx.core as mx
 
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .save_handle import save_handle_enabled
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry, ModelOwnershipError
@@ -540,6 +541,17 @@ class EngineCore:
             **kwargs,
         )
 
+        # Save-handle (dark by default): hold a local reference to the scheduler's
+        # request so we can read its authoritative prompt_token_ids (set during
+        # scheduling) after completion — even once the scheduler drops it from its
+        # active map. No instance state, no hot-loop edits; non-streaming path only.
+        _save_req = (
+            self.scheduler.requests.get(request_id)
+            if save_handle_enabled()
+            and isinstance(getattr(self.scheduler, "requests", None), dict)
+            else None
+        )
+
         # Wait for completion using event instead of streaming
         # This avoids the waiting_consumer tracking overhead
         event = self._finished_events.get(request_id)
@@ -578,6 +590,10 @@ class EngineCore:
 
         if final_output.error:
             raise RuntimeError(final_output.error)
+
+        # Surface the authoritative prompt token-ids for slot save-by-handle.
+        if _save_req is not None and getattr(_save_req, "prompt_token_ids", None):
+            final_output.prompt_token_ids = list(_save_req.prompt_token_ids)
 
         return final_output
 

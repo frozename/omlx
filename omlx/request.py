@@ -270,6 +270,9 @@ class RequestOutput:
     tool_calls: Optional[List[Dict[str, str]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Authoritative prompt token-ids (scheduler-tokenized) for slot save-by-handle.
+    # Populated only on the non-streaming path when the save-handle feature is on.
+    prompt_token_ids: Optional[List[int]] = None
     # Error message (set when engine encounters an unrecoverable error)
     error: Optional[str] = None
 

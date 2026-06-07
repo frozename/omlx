@@ -30,6 +30,9 @@ class GenerationOutput:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     # Prefix cache stats
     cached_tokens: int = 0
+    # Full prompt token-ids the engine consumed, surfaced for slot save-by-handle
+    # (non-streaming path). Empty unless OMLX_SAVE_HANDLE_ENABLED is set.
+    prompt_token_ids: List[int] = field(default_factory=list)
 
 
 class BaseEngine(ABC):

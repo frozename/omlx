@@ -522,6 +522,7 @@ class BatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            prompt_token_ids=list(output.prompt_token_ids) if output.prompt_token_ids else [],
         )
 
     async def stream_generate(
