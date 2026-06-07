@@ -159,6 +159,7 @@ from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
 from .cache.model_arch import _model_uses_chunked_kv_cache
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
+from .save_handle import get_save_handle_table, save_handle_enabled
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -2361,6 +2362,15 @@ async def slot_action(
             parsed_tokens.append(int(token))
         prompt_tokens = parsed_tokens
 
+    # L4: when no explicit prompt_tokens were supplied for a save, resolve them
+    # from a previously-recorded save handle — the save's request_handle equals
+    # the save_handle the chat carried. Gated; a miss falls through to the legacy
+    # active-request scan (which still 500s on a cold request — unchanged).
+    if action == "save" and prompt_tokens is None and save_handle_enabled():
+        recorded = get_save_handle_table().get(request_handle, resolved_model)
+        if recorded:
+            prompt_tokens = recorded
+
     if action == "restore":
         if _is_slot_generating(resolved_model):
             raise HTTPException(
@@ -3324,6 +3334,18 @@ async def create_chat_completion(
                     correlation_id=correlation_id,
                 ),
             ) from exc
+
+        # Record prompt token-ids under the save handle (L4): a subsequent
+        # /slots/0?action=save keyed on the same handle serializes this slot.
+        # Gated; only fires when the engine surfaced ids (non-streaming + on).
+        if (
+            request.x_omlx_save_handle is not None
+            and save_handle_enabled()
+            and output.prompt_token_ids
+        ):
+            get_save_handle_table().put(
+                request.x_omlx_save_handle, output.prompt_token_ids, resolved_model
+            )
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
