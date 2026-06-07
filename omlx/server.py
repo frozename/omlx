@@ -3267,7 +3267,25 @@ async def create_chat_completion(
     ) as exc:
         return JSONResponse(status_code=409, content=_slot_apply_http_detail(exc))
 
-    if request.stream:
+    # Save-handle (L4): record-only — it is NOT fed to the restore-apply preflight
+    # above (which 409s a cold chat). Validate it at the edge before any use.
+    if request.x_omlx_save_handle is not None:
+        _sh = request.x_omlx_save_handle
+        if not _sh or len(_sh) > 128 or any(c.isspace() or c in "/\\" for c in _sh):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "invalid_save_handle",
+                        "message": "x_omlx_save_handle must be a non-empty token <=128 chars with no path separators or whitespace",
+                    }
+                },
+            )
+
+    # Force non-stream when a save handle is present: the slot-save record is
+    # materialized from the fully-buffered output in _build_chat_completion,
+    # which the streaming path never reaches.
+    if request.stream and request.x_omlx_save_handle is None:
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
@@ -3397,7 +3415,7 @@ async def create_chat_completion(
             ),
         ).model_dump_json(exclude_none=True)
 
-    if request.x_omlx_request_handle is not None:
+    if request.x_omlx_request_handle is not None or request.x_omlx_save_handle is not None:
         payload = await _build_chat_completion()
         return JSONResponse(content=json.loads(payload))
 

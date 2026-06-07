@@ -38,3 +38,23 @@ def test_request_output_defaults_none():
 
 def test_request_output_carries_ids():
     assert RequestOutput(request_id="r", prompt_token_ids=[4, 5]).prompt_token_ids == [4, 5]
+
+
+# --- Phase 2: x_omlx_save_handle request field ---
+
+from omlx.api.openai_models import ChatCompletionRequest
+
+_MSGS = [{"role": "user", "content": "hi"}]
+
+
+def test_request_save_handle_absent_is_none():
+    r = ChatCompletionRequest(model="m", messages=_MSGS)
+    assert r.x_omlx_save_handle is None
+
+
+def test_request_save_handle_parses_and_is_disjoint_from_request_handle():
+    r = ChatCompletionRequest(model="m", messages=_MSGS, x_omlx_save_handle="abc123")
+    assert r.x_omlx_save_handle == "abc123"
+    # Must not bleed into the restore-apply handle (which would 409 a cold chat).
+    assert r.x_omlx_request_handle is None
+    assert r.x_omlx_restore_epoch is None

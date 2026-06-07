@@ -259,6 +259,11 @@ class ChatCompletionRequest(BaseModel):
     # Slot v2 Phase 2 apply-linkage fields (vendor-prefixed)
     x_omlx_request_handle: Optional[str] = None
     x_omlx_restore_epoch: Optional[str] = None
+    # Save-intent handle (L4 KV slot save-by-handle). DISJOINT from
+    # x_omlx_request_handle: record-only, must never reach the restore-apply
+    # preflight (which 409s a cold chat). Setting it also forces the
+    # non-streaming path so the prompt token-ids can be recorded.
+    x_omlx_save_handle: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod
