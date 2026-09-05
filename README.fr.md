@@ -55,7 +55,7 @@
 
 ### Application macOS
 
-Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. À noter que l'application macOS n'installe pas la commande CLI `omlx`. Pour une utilisation en terminal, installez via Homebrew ou depuis les sources.
+Téléchargez le `.dmg` depuis les [Releases](https://github.com/jundot/omlx/releases), glissez-le dans Applications, c'est tout. L'application inclut une mise à jour automatique intégrée, les futures mises à jour se font en un clic. L'application macOS installe aussi un shim CLI léger dans `~/.omlx/bin/omlx`, ce qui permet de contrôler le serveur géré par l'app depuis le terminal ou Apple Shortcuts.
 
 ### Homebrew
 
@@ -73,6 +73,12 @@ brew services start omlx
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
 ```
 
+Les kernels natifs personnalisés optionnels pour GLM-5.2 / MiniMax M3 nécessitent actuellement un build HEAD :
+
+```bash
+brew install omlx --HEAD --with-custom-kernel
+```
+
 ### Depuis les sources
 
 ```bash
@@ -80,9 +86,12 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 pip install -e .          # Core uniquement
 pip install -e ".[mcp]"   # Avec support MCP (Model Context Protocol)
+
+# Optionnel : kernels natifs personnalisés GLM-5.2 / MiniMax M3
+OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
 ```
 
-Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4).
+Nécessite macOS 15.0+ (Sequoia), Python 3.10+, et Apple Silicon (M1/M2/M3/M4/M5).
 
 ## Démarrage rapide
 
@@ -171,6 +180,7 @@ Configurez les paramètres d'échantillonnage, les kwargs du template de chat, l
 
 - **Alias de modèle** : définissez un nom personnalisé visible par l'API. `/v1/models` retourne l'alias, et les requêtes acceptent l'alias comme le nom du répertoire.
 - **Type de modèle** : forcez manuellement un modèle en LLM ou VLM indépendamment de l'auto-détection.
+- **Profils** : enregistrez des ensembles nommés de paramètres par modèle et basculez entre eux depuis le panneau d'admin. Un profil peut éventuellement être exposé comme son propre modèle : `/v1/models` liste alors aussi `<modèle>:<profil>` (par ex. `qwen3-8b:thinking`), qui s'exécute sur le même moteur que le modèle de base avec les paramètres du profil appliqués à chaque requête — sans mémoire supplémentaire ni rechargement. Lorsque le modèle de base possède un alias, l'identifiant exposé est annoncé sous la forme `<alias>:<profil>` ; la forme avec le nom du répertoire continue de fonctionner, comme pour le modèle de base.
 
 <p align="center">
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
@@ -210,7 +220,7 @@ Benchmarking en un clic depuis le panneau d'admin. Mesure le prefill (PP) et la 
 
 ### Application barre de menus macOS
 
-Application native PyObjC dans la barre de menus (pas Electron). Démarrez, arrêtez et surveillez le serveur sans ouvrir un terminal. Inclut des statistiques de service persistantes (survivent aux redémarrages), un redémarrage automatique en cas de crash, et une mise à jour automatique intégrée.
+Application native Swift / SwiftUI dans la barre de menus (pas Electron). Démarrez, arrêtez et surveillez le serveur sans ouvrir un terminal. Inclut des statistiques de service persistantes (survivent aux redémarrages), un redémarrage automatique en cas de crash, et une mise à jour automatique via Sparkle.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -338,22 +348,23 @@ pytest -m "not slow"
 
 ### Application macOS
 
-Nécessite Python 3.11+ et [venvstacks](https://venvstacks.lmstudio.ai) (`pip install venvstacks`).
+L'application SwiftUI native vit dans `apps/omlx-mac/`. Nécessite Xcode 26.5+ et Python 3.11+. venvstacks est déclaré comme dépendance dev, donc `pip install -e ".[dev]"` (ou `uv sync --dev`) installe la version épinglée. Le script de build retombe sur `uvx venvstacks` ou `pipx run venvstacks` si vous préférez un runner d'outils global.
 
 ```bash
-cd packaging
+# Préparer un oMLX.app exécutable (xcodebuild + couches Python venvstacks + signature ad-hoc)
+apps/omlx-mac/Scripts/build.sh release
 
-# Build complet (venvstacks + bundle app + DMG)
-python build.py
+# Le résultat atterrit dans apps/omlx-mac/build/Stage/oMLX.app
+open apps/omlx-mac/build/Stage/oMLX.app
 
-# Ignorer venvstacks (modifications de code uniquement)
-python build.py --skip-venv
+# Forcer une reconstruction de venvstacks (sinon mis en cache par empreinte)
+apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 
-# DMG uniquement
-python build.py --dmg-only
+# Préparer avec les kernels natifs personnalisés optionnels GLM-5.2 / MiniMax M3
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
-Voir [packaging/README.md](packaging/README.md) pour les détails sur la structure du bundle app et la configuration des couches.
+Le premier build à froid prend 10–20 minutes (assemblage des couches Python venvstacks). Les builds suivants réutilisent `packaging/_export/` et finissent en environ 4 minutes. Voir [packaging/README.md](packaging/README.md) pour la configuration des couches et [apps/omlx-mac/](apps/omlx-mac/) pour les sources Swift.
 
 ## Contribuer
 

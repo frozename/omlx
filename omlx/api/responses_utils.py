@@ -47,6 +47,69 @@ def _try_parse_json(s: str):
         return s
 
 
+_TOOL_OUTPUT_TEXT_TYPES = ("input_text", "text", "output_text")
+
+
+def _extract_tool_output_text(
+    output: List[Any],
+    image_parts: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Extract text from a multimodal function_call_output list.
+
+    Returns None when the list has no recognized content parts so the
+    caller can fall back to JSON serialization. Image parts are appended
+    to ``image_parts`` for VLM processing when provided; otherwise they
+    become a placeholder so base64 payloads never reach the prompt.
+    """
+    recognized = any(
+        isinstance(part, dict)
+        and part.get("type") in (*_TOOL_OUTPUT_TEXT_TYPES, "input_image")
+        for part in output
+    )
+    if not recognized:
+        return None
+
+    text_parts: List[str] = []
+    for part in output:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict):
+            part_type = part.get("type")
+            if part_type in _TOOL_OUTPUT_TEXT_TYPES:
+                text_parts.append(part.get("text", ""))
+            elif part_type == "input_image":
+                if image_parts is not None:
+                    image_url = part.get("image_url", part.get("url", ""))
+                    image_parts.append(
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": part.get("detail", "auto"),
+                        }
+                    )
+                else:
+                    text_parts.append("(see attached image)")
+            else:
+                text_parts.append(json.dumps(part))
+        else:
+            text_parts.append(str(part))
+    return "\n".join(p for p in text_parts if p)
+
+
+def _flush_pending_tool_images(
+    messages: List[Dict[str, Any]],
+    pending_images: List[Dict[str, Any]],
+) -> None:
+    """Flush tool-output images as a user message after a tool run.
+
+    Emitted only once the consecutive function_call_output items end so
+    tool messages stay contiguous for strict chat templates.
+    """
+    if pending_images:
+        messages.append({"role": "user", "content": list(pending_images)})
+        pending_images.clear()
+
+
 def _flush_pending_tool_calls(
     messages: List[Dict[str, Any]],
     pending: List[Dict[str, Any]],
@@ -85,7 +148,9 @@ def _flush_pending_tool_calls(
     return ""
 
 
-def _consolidate_system_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _consolidate_system_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """Move all system messages to the front and merge them into one."""
     system_parts: List[str] = []
     non_system: List[Dict[str, Any]] = []
@@ -112,6 +177,8 @@ def convert_responses_input_to_messages(
     input_data: Optional[Union[str, List[InputItem]]],
     instructions: Optional[str] = None,
     previous_messages: Optional[List[Dict[str, Any]]] = None,
+    consolidate_system_messages: bool = True,
+    preserve_images: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert Responses API input to internal messages format.
 
@@ -119,16 +186,24 @@ def convert_responses_input_to_messages(
         input_data: String prompt or list of InputItem objects.
         instructions: System prompt (prepended as system message).
         previous_messages: Messages from previous_response_id chain.
+        consolidate_system_messages: If True, merge all system/developer content
+            into one leading system message for strict templates. Server code can
+            set this to False and resolve placement after the target template is
+            known.
+        preserve_images: If True, images in function_call_output lists are
+            preserved as a user message following the tool run so VLM engines
+            can extract them. If False, they become a text placeholder.
 
     Returns:
         List of message dicts compatible with chat template.
     """
     messages: List[Dict[str, Any]] = []
 
-    # Collect all system/developer content to merge into a single system message.
-    # Many chat templates (Qwen, Llama, etc.) only allow one system message
-    # at position 0. Codex can send both `instructions` and developer-role
-    # input items, so we merge them.
+    # Collect system/developer content to merge into a single system message
+    # when strict-template compatibility mode is active. In deferred mode,
+    # top-level instructions still form a leading system message, but input
+    # system/developer items keep their original position until template
+    # capability probing decides whether they can be preserved.
     system_parts: List[str] = []
     if instructions:
         system_parts.append(instructions)
@@ -141,25 +216,39 @@ def convert_responses_input_to_messages(
     if input_data is None:
         if system_parts:
             messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
-        return _consolidate_system_messages(messages)
+        return (
+            _consolidate_system_messages(messages)
+            if consolidate_system_messages
+            else messages
+        )
 
     if isinstance(input_data, str):
         if system_parts:
             messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
         messages.append({"role": "user", "content": input_data})
-        return _consolidate_system_messages(messages)
+        return (
+            _consolidate_system_messages(messages)
+            if consolidate_system_messages
+            else messages
+        )
 
     # Process input items
     # Track pending tool calls for grouping into a single assistant message
     pending_tool_calls: List[Dict[str, Any]] = []
     # Track reasoning content to attach to the next assistant message
     pending_reasoning: str = ""
+    # Track images extracted from function_call_output lists; flushed as a
+    # user message once the consecutive tool-output run ends
+    pending_tool_images: List[Dict[str, Any]] = []
 
     for item in input_data:
         # Resolve effective type: EasyInputMessage has no type field
         item_type = item.type
         if item_type is None and item.role is not None:
             item_type = "message"
+
+        if item_type != "function_call_output":
+            _flush_pending_tool_images(messages, pending_tool_images)
 
         if item_type == "message":
             # Flush pending tool calls before a new message. Reasoning
@@ -194,11 +283,13 @@ def convert_responses_input_to_messages(
                             has_image = True
                             image_url = part.get("image_url", part.get("url", ""))
                             detail = part.get("detail", "auto")
-                            converted_parts.append({
-                                "type": "input_image",
-                                "image_url": image_url,
-                                "detail": detail,
-                            })
+                            converted_parts.append(
+                                {
+                                    "type": "input_image",
+                                    "image_url": image_url,
+                                    "detail": detail,
+                                }
+                            )
                     elif isinstance(part, str):
                         text_parts.append(part)
                         converted_parts.append({"type": "text", "text": part})
@@ -208,9 +299,13 @@ def convert_responses_input_to_messages(
                 else:
                     content = "\n".join(text_parts) if text_parts else ""
 
-            # Merge system/developer messages into the single system block
+            # Merge system/developer messages into the single system block unless
+            # the server is deferring placement until the template is known.
             if role == "system":
-                system_parts.append(content or "")
+                if consolidate_system_messages:
+                    system_parts.append(content or "")
+                else:
+                    messages.append({"role": "system", "content": content or ""})
             else:
                 msg_dict: Dict[str, Any] = {"role": role, "content": content or ""}
                 if role == "assistant" and pending_reasoning:
@@ -222,7 +317,9 @@ def convert_responses_input_to_messages(
             # Collect reasoning summary text to attach to the next
             # assistant message as reasoning_content.
             summary = getattr(item, "summary", None) or (
-                (item.model_extra or {}).get("summary") if hasattr(item, "model_extra") else None
+                (item.model_extra or {}).get("summary")
+                if hasattr(item, "model_extra")
+                else None
             )
             if summary:
                 parts = []
@@ -236,14 +333,16 @@ def convert_responses_input_to_messages(
         elif item.type == "function_call":
             # Assistant's tool call — accumulate for grouping
             call_id = item.call_id or item.id or f"call_{uuid.uuid4().hex[:8]}"
-            pending_tool_calls.append({
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": item.name or "",
-                    "arguments": _try_parse_json(item.arguments or "{}"),
-                },
-            })
+            pending_tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.name or "",
+                        "arguments": _try_parse_json(item.arguments or "{}"),
+                    },
+                }
+            )
 
         elif item.type == "function_call_output":
             # Flush pending tool calls first. Any pending reasoning gets
@@ -255,14 +354,27 @@ def convert_responses_input_to_messages(
                 pending_reasoning=pending_reasoning,
             )
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item.call_id or "",
-                "content": item.output or "",
-            })
+            output_content = item.output or ""
+            if isinstance(item.output, list):
+                extracted = _extract_tool_output_text(
+                    item.output,
+                    pending_tool_images if preserve_images else None,
+                )
+                output_content = (
+                    extracted if extracted is not None else json.dumps(item.output)
+                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.call_id or "",
+                    "content": output_content,
+                }
+            )
 
-    # Flush remaining pending tool calls. If reasoning survived without
-    # a trailing message, attach it to the synthesized tool_calls message.
+    # Flush images from a trailing tool-output run, then any remaining
+    # pending tool calls. If reasoning survived without a trailing
+    # message, attach it to the synthesized tool_calls message.
+    _flush_pending_tool_images(messages, pending_tool_images)
     _flush_pending_tool_calls(
         messages,
         pending_tool_calls,
@@ -274,7 +386,11 @@ def convert_responses_input_to_messages(
     if system_parts:
         messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
 
-    return _consolidate_system_messages(messages)
+    return (
+        _consolidate_system_messages(messages)
+        if consolidate_system_messages
+        else messages
+    )
 
 
 # =============================================================================
@@ -446,8 +562,13 @@ class ResponseStore:
         if "public_response" in response_data:
             record = copy.deepcopy(response_data)
             record.setdefault("response_id", response_id)
-            record.setdefault("created_at", record.get("public_response", {}).get("created_at", 0))
-            record.setdefault("previous_response_id", record.get("public_response", {}).get("previous_response_id"))
+            record.setdefault(
+                "created_at", record.get("public_response", {}).get("created_at", 0)
+            )
+            record.setdefault(
+                "previous_response_id",
+                record.get("public_response", {}).get("previous_response_id"),
+            )
             record.setdefault("input_messages", [])
             record.setdefault(
                 "output_messages",
@@ -497,14 +618,18 @@ class ResponseStore:
             try:
                 with path.open("r", encoding="utf-8") as f:
                     raw = json.load(f)
-                response_id = raw.get("response_id") or raw.get("public_response", {}).get("id")
+                response_id = raw.get("response_id") or raw.get(
+                    "public_response", {}
+                ).get("id")
                 if not response_id:
                     raise ValueError("missing response_id")
                 loaded.append(self._normalize_record(response_id, raw))
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning("Skipping corrupt response state file %s: %s", path, exc)
 
-        loaded.sort(key=lambda record: (record.get("created_at", 0), record["response_id"]))
+        loaded.sort(
+            key=lambda record: (record.get("created_at", 0), record["response_id"])
+        )
         for record in loaded:
             self._store[record["response_id"]] = record
         self._evict_oldest()
@@ -624,14 +749,16 @@ def normalize_response_output_to_messages(
             messages.append(msg_dict)
         elif item_type == "function_call":
             call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:8]}")
-            pending_tool_calls.append({
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": item.get("name", ""),
-                    "arguments": _try_parse_json(item.get("arguments", "{}")),
-                },
-            })
+            pending_tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": _try_parse_json(item.get("arguments", "{}")),
+                    },
+                }
+            )
 
     _flush_pending_tool_calls(
         messages,

@@ -11,6 +11,7 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any, Dict, Optional
 
@@ -18,11 +19,33 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.mlx_audio_sampling import ensure_uncompiled_tts_samplers
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
+
+# Kokoro voice names are ``<lang><gender>_<name>`` — af_heart, bm_george,
+# zf_xiaoxiao — where the first letter is the G2P pipeline lang_code
+# (a/b = US/GB English, e = es, f = fr, h = hi, i = it, j = ja, p = pt-br,
+# z = zh; see mlx_audio.tts.models.kokoro.pipeline.LANG_CODES).
+_KOKORO_VOICE_RE = re.compile(r"^([abefhijpz])[fm]_")
+
+
+def _infer_kokoro_lang_code(voice: Optional[str]) -> Optional[str]:
+    """Infer Kokoro's G2P lang_code from its voice naming convention.
+
+    Without a lang_code the Kokoro pipeline falls back to English G2P and
+    non-English text is mangled or dropped. Only full ``<lang><gender>_``
+    prefixes match; other backends' speaker names (e.g. Qwen3-TTS's
+    'aiden', 'eric') must not trigger inference — those models have their
+    own lang_code defaults such as 'auto'.
+    """
+    if not voice:
+        return None
+    match = _KOKORO_VOICE_RE.match(voice.lower())
+    return match.group(1) if match else None
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -85,6 +108,10 @@ class TTSEngine(BaseNonStreamingEngine):
 
         logger.info(f"Starting TTS engine: {self._model_name}")
 
+        # Must run before mlx-audio imports so backend modules bind the
+        # compile-free samplers instead of mlx-lm's compiled ones (#2312).
+        ensure_uncompiled_tts_samplers()
+
         try:
             from mlx_audio.tts.utils import load_model as _load_model
         except ImportError as exc:
@@ -108,7 +135,9 @@ class TTSEngine(BaseNonStreamingEngine):
                 logger.warning(
                     "Strict weight loading failed for %s (likely quantized "
                     "model with mlx-audio compatibility issue), retrying "
-                    "with strict=False: %s", model_name, exc,
+                    "with strict=False: %s",
+                    model_name,
+                    exc,
                 )
                 return _load_model(model_name, strict=False)
 
@@ -144,6 +173,7 @@ class TTSEngine(BaseNonStreamingEngine):
         top_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        language: Optional[str] = None,
         **kwargs,
     ) -> bytes:
         """
@@ -161,6 +191,7 @@ class TTSEngine(BaseNonStreamingEngine):
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty for generation
             max_tokens: Maximum number of tokens to generate
+            language: Optional language hint for multilingual TTS models
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -172,8 +203,12 @@ class TTSEngine(BaseNonStreamingEngine):
         import time
 
         logger.info(
-            "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, ref_audio=%s",
-            self._model_name, len(text), voice, speed,
+            "TTS synthesize: model=%s, text_len=%d, voice=%s, language=%s, speed=%.1f, ref_audio=%s",
+            self._model_name,
+            len(text),
+            voice,
+            language or "auto",
+            speed,
             "yes" if ref_audio else "no",
         )
 
@@ -186,6 +221,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 "verbose": False,
             }
             import inspect
+
             gen_params = inspect.signature(model.generate).parameters
             if voice is not None:
                 # Route voice to the correct generate() kwarg.
@@ -198,6 +234,13 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
+            if "lang_code" in gen_params:
+                if language:
+                    gen_kwargs["lang_code"] = language
+                elif "voice" in gen_params:
+                    inferred = _infer_kokoro_lang_code(voice)
+                    if inferred:
+                        gen_kwargs["lang_code"] = inferred
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
@@ -247,23 +290,18 @@ class TTSEngine(BaseNonStreamingEngine):
         )
         try:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                get_mlx_executor(), _synthesize_sync
-            )
+            result = await loop.run_in_executor(get_mlx_executor(), _synthesize_sync)
 
             elapsed = time.monotonic() - t0
             logger.info(
                 "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-                self._model_name, elapsed, len(result),
+                self._model_name,
+                elapsed,
+                len(result),
             )
             return result
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+            await self._finish_activity(activity_id)
 
     async def stream_synthesize_pcm(
         self,
@@ -279,20 +317,27 @@ class TTSEngine(BaseNonStreamingEngine):
         repetition_penalty: Optional[float] = None,
         max_tokens: Optional[int] = None,
         streaming_interval: float = 0.4,
+        language: Optional[str] = None,
         **kwargs,
     ) -> AsyncIterator[tuple[int, int, int, bytes]]:
         """Stream synthesized PCM chunks from models that natively support it."""
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         if not self.supports_native_tts_streaming():
-            raise NotImplementedError("Loaded TTS model does not expose native streaming")
+            raise NotImplementedError(
+                "Loaded TTS model does not expose native streaming"
+            )
 
         import inspect
         import time
 
         logger.info(
-            "TTS native stream start: model=%s, text_len=%d, voice=%s, interval=%.2fs",
-            self._model_name, len(text), voice, streaming_interval,
+            "TTS native stream start: model=%s, text_len=%d, voice=%s, language=%s, interval=%.2fs",
+            self._model_name,
+            len(text),
+            voice,
+            language or "auto",
+            streaming_interval,
         )
 
         model = self._model
@@ -314,6 +359,13 @@ class TTSEngine(BaseNonStreamingEngine):
                     gen_kwargs["instruct"] = voice
             if instructions is not None and "instruct" in gen_params:
                 gen_kwargs["instruct"] = instructions
+            if "lang_code" in gen_params:
+                if language:
+                    gen_kwargs["lang_code"] = language
+                elif "voice" in gen_params:
+                    inferred = _infer_kokoro_lang_code(voice)
+                    if inferred:
+                        gen_kwargs["lang_code"] = inferred
             if speed != 1.0:
                 gen_kwargs["speed"] = speed
             if ref_audio is not None and "ref_audio" in gen_params:
@@ -349,7 +401,11 @@ class TTSEngine(BaseNonStreamingEngine):
             if audio is None:
                 return None
             sample_rate = int(
-                getattr(result, "sample_rate", getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE))
+                getattr(
+                    result,
+                    "sample_rate",
+                    getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE),
+                )
             )
             return sample_rate, 1, 2, self._audio_array_to_pcm_bytes(audio)
 
@@ -378,15 +434,13 @@ class TTSEngine(BaseNonStreamingEngine):
                 )
                 yield sample_rate, channels, sample_width, pcm_bytes
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+            await self._finish_activity(activity_id)
             logger.info(
                 "TTS native stream done: model=%s, %.2fs, chunks=%d, pcm_bytes=%d",
-                self._model_name, time.monotonic() - t0, chunk_count, total_bytes,
+                self._model_name,
+                time.monotonic() - t0,
+                chunk_count,
+                total_bytes,
             )
 
     def get_stats(self) -> Dict[str, Any]:

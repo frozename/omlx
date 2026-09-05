@@ -27,8 +27,9 @@ import os
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Literal
 
 from .cache.model_arch import _model_uses_chunked_kv_cache
 from .config import parse_size
@@ -44,42 +45,65 @@ SETTINGS_VERSION = "1.0"
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
 
+# One-line bootstrap file the macOS app writes when the user moves their data root
+BASE_PATH_BOOTSTRAP_FILE = (
+    Path.home() / "Library" / "Application Support" / "oMLX" / "base-path"
+)
+
+
+def resolve_default_base_path() -> Path:
+    """
+    Resolve the base path to use when none was passed explicitly.
+
+    Priority: ``OMLX_BASE_PATH`` env var > the macOS app's bootstrap file >
+    ``~/.omlx``. This matches AppConfig.currentBasePath() in the Swift app
+    so the CLI and GUI agree on where settings.json lives.
+    """
+    env_value = os.environ.get("OMLX_BASE_PATH")
+    if env_value:
+        return Path(env_value).expanduser().resolve()
+
+    try:
+        raw = BASE_PATH_BOOTSTRAP_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+    if raw:
+        return Path(raw).expanduser().resolve()
+
+    return DEFAULT_BASE_PATH
+
 
 def get_system_memory() -> int:
     """
     Return total system RAM in bytes.
 
-    Uses psutil if available, falls back to os.sysconf on Unix.
+    Uses os.sysconf first, then psutil_compat so macOS does not depend on
+    psutil's VM stats adapter, which can lag new HOST_VM_INFO64 layouts.
 
     Returns:
         Total RAM in bytes.
     """
     try:
-        import psutil
-
-        return psutil.virtual_memory().total
-    except ImportError:
-        pass
-
-    # Fallback for Unix systems
-    try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
-        return pages * page_size
-    except (AttributeError, ValueError):
+        memory = int(pages) * int(page_size)
+        if memory > 0:
+            return memory
+    except (AttributeError, ValueError, OSError):
         pass
+
+    try:
+        from .utils import psutil_compat
+
+        memory = int(psutil_compat.get_total_memory())
+        if memory > 0:
+            return memory
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("psutil_compat failed to detect system memory: %s", exc)
 
     # Default to 16GB if detection fails
     logger.warning("Could not detect system memory, defaulting to 16GB")
     return 16 * 1024**3
-
-
-def _adaptive_system_reserve(total: int) -> int:
-    """Adaptive system reservation: 20% of total, clamped to [2GB, 8GB]."""
-    reserve = int(total * 0.20)
-    min_reserve = 2 * 1024**3
-    max_reserve = 8 * 1024**3
-    return max(min_reserve, min(reserve, max_reserve))
 
 
 def get_ssd_capacity(path: str | Path) -> int:
@@ -108,6 +132,38 @@ def get_ssd_capacity(path: str | Path) -> int:
         return 500 * 1024**3
 
 
+# Burst Decode UI modes -> (decode_burst_max_steps, decode_burst_budget_single_s).
+# These mirror the OMLX_DECODE_BURST_* env vars read by EngineConfig
+# (engine_core.py). "off" fully disables bursting via max_steps=1; the on-levels
+# keep the default step cap and set the single-request time budget that controls
+# how many decode steps coalesce per event-loop hand-off (higher = faster, but
+# tokens stream in larger chunks).
+BURST_DECODE_MODES: dict[str, tuple[int, float]] = {
+    "off": (1, 0.0),
+    "light": (64, 0.05),
+    "balanced": (64, 0.1),
+    "aggressive": (64, 0.2),
+}
+DEFAULT_BURST_DECODE_MODE = "balanced"
+
+
+def burst_decode_env(mode: str) -> dict[str, str]:
+    """Map a Burst Decode mode to the OMLX_DECODE_BURST_* env vars.
+
+    EngineConfig reads these at construction, so seeding them lets engines
+    loaded later pick up the mode without a server restart. An unknown mode
+    falls back to the default so a stale settings.json never disables bursting
+    unexpectedly.
+    """
+    max_steps, single_s = BURST_DECODE_MODES.get(
+        mode, BURST_DECODE_MODES[DEFAULT_BURST_DECODE_MODE]
+    )
+    return {
+        "OMLX_DECODE_BURST_MAX_STEPS": str(max_steps),
+        "OMLX_DECODE_BURST_BUDGET_SINGLE_S": str(single_s),
+    }
+
+
 @dataclass
 class ServerSettings:
     """Server configuration settings."""
@@ -118,6 +174,19 @@ class ServerSettings:
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
     server_aliases: list[str] = field(default_factory=list)
     sse_keepalive_mode: str = "chunk"
+    auto_start_on_launch: bool = True
+    burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
+    preserve_mid_system_cache: bool = True
+    distributed_inference_enabled: bool = False
+    # Human-readable size, same grammar as cache limits ("100MB", "1GB").
+    max_audio_upload_size: str = "100MB"
+
+    def max_audio_upload_bytes(self) -> int:
+        """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
+        size = parse_size(self.max_audio_upload_size)
+        if size <= 0:
+            raise ValueError("max_audio_upload_size must be positive")
+        return size
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -126,13 +195,22 @@ class ServerSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
+        _host = data.get("host", data.get("bind_address", "127.0.0.1"))
         return cls(
-            host=data.get("host", "127.0.0.1"),
+            host=", ".join(_host) if isinstance(_host, list) else str(_host),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
             server_aliases=data.get("server_aliases", []),
             sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
+            auto_start_on_launch=data.get("auto_start_on_launch", True),
+            burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
+            preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            distributed_inference_enabled=data.get(
+                "distributed_inference_enabled",
+                False,
+            ),
+            max_audio_upload_size=data.get("max_audio_upload_size", "100MB"),
         )
 
 
@@ -142,8 +220,10 @@ class ModelSettings:
 
     model_dirs: list[str] = field(default_factory=list)  # [] means ~/.omlx/models
     model_dir: str | None = None  # Deprecated: kept for backward compatibility
-    max_model_memory: str = "auto"  # "auto" means 80% of RAM
     model_fallback: bool = False  # Use default model when requested model not found
+    hide_helper_models: bool = (
+        False  # Hide dFlash/Assistant/Draft helper models from /v1/models
+    )
 
     def get_model_dirs(self, base_path: Path) -> list[Path]:
         """
@@ -173,30 +253,13 @@ class ModelSettings:
         """
         return self.get_model_dirs(base_path)[0]
 
-    def get_max_model_memory_bytes(self) -> int | None:
-        """
-        Get max model memory in bytes, or None if disabled.
-
-        Returns:
-            Max model memory in bytes (90% of usable RAM if "auto"),
-            or None if disabled (no limit).
-        """
-        value = self.max_model_memory.strip().lower()
-        if value == "disabled":
-            return None
-        if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return max(1 * 1024**3, int((total - reserve) * 0.9))
-        return parse_size(self.max_model_memory)
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "model_dirs": self.model_dirs,
             "model_dir": self.model_dirs[0] if self.model_dirs else self.model_dir,
-            "max_model_memory": self.max_model_memory,
             "model_fallback": self.model_fallback,
+            "hide_helper_models": self.hide_helper_models,
         }
 
     @classmethod
@@ -209,8 +272,8 @@ class ModelSettings:
         return cls(
             model_dirs=model_dirs,
             model_dir=data.get("model_dir"),
-            max_model_memory=data.get("max_model_memory", "auto"),
             model_fallback=data.get("model_fallback", False),
+            hide_helper_models=data.get("hide_helper_models", False),
         )
 
 
@@ -219,13 +282,25 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_concurrent_requests: int = 8
+    embedding_batch_size: int = 32
+    # When True, long prefills are interleaved with decode steps.
+    # Reduces TTFT for concurrent requests at the cost of per-step overhead.
+    chunked_prefill: bool = False
+    # What the prefill memory guard optimizes under pressure:
+    #   "context" (default) — shrink prefill steps down to the floor so the
+    #     largest possible prompt still completes (slower near the ceiling).
+    #   "speed" — never shrink; keep full-size steps and only admit prompts
+    #     that fit at full speed (smaller effective context limit).
+    prefill_priority: str = "context"
+    # When True (default), prefill yields GPU time to running decodes:
+    # prompts are force-chunked under contention, chunks are capped while
+    # any engine decodes, and each chunk accrues a decode time debt repaid
+    # before the next chunk runs. Off restores the pre-fairness behavior.
+    decode_fairness: bool = True
     # Optional cap on sequences fused into a single decode step. When None,
     # decode fusion follows max_concurrent_requests; when set, it overrides
     # only the decode-step batch size, leaving HTTP admission untouched.
     max_completion_batch_size: int | None = None
-    # When True, long prefills are interleaved with decode steps.
-    # Reduces TTFT for concurrent requests at the cost of per-step overhead.
-    chunked_prefill: bool = False
     # Per-model overrides for `max_concurrent_requests`. Keyed by either
     # the model id (basename of the model dir, e.g. "Qwen3-8B-MLX-4bit")
     # or the fully-qualified model_name. When set, the Scheduler for that
@@ -239,11 +314,8 @@ class SchedulerSettings:
     # `per_model_max_concurrent`: model-id basename OR fully-qualified
     # model_name. Models without an entry fall back to the global
     # `max_completion_batch_size` (which itself defaults to
-    # `max_concurrent_requests` for back-compat) and the hardcoded
-    # `prefill_step_size=2048` respectively. Lets operators tune the
-    # batch-fusion ceiling and prefill chunk size per model — small
-    # models often saturate at larger batch sizes than 8B-class peers,
-    # and prefill chunk sweet-spots differ by model.
+    # `max_concurrent_requests` for back-compat) and the scheduler's
+    # `prefill_step_size` respectively.
     per_model_max_completion_batch_size: dict[str, int] = field(
         default_factory=dict
     )
@@ -264,6 +336,10 @@ class SchedulerSettings:
             value = data.get("completion_batch_size")
         if value is None:
             value = 8
+        embedding_batch_size = data.get("embedding_batch_size", 32)
+        prefill_priority = data.get("prefill_priority", "context")
+        if prefill_priority not in ("context", "speed"):
+            prefill_priority = "context"
         per_model = data.get("per_model_max_concurrent") or {}
         # Coerce to dict[str, int] regardless of JSON source typing.
         per_model_typed: dict[str, int] = {
@@ -279,8 +355,11 @@ class SchedulerSettings:
         }
         return cls(
             max_concurrent_requests=value,
-            max_completion_batch_size=data.get("max_completion_batch_size"),
+            embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
+            prefill_priority=prefill_priority,
+            decode_fairness=bool(data.get("decode_fairness", True)),
+            max_completion_batch_size=data.get("max_completion_batch_size"),
             per_model_max_concurrent=per_model_typed,
             per_model_max_completion_batch_size=per_model_mcb_typed,
             per_model_prefill_step_size=per_model_pss_typed,
@@ -296,8 +375,57 @@ class CacheSettings:
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
+    # When True (and the hot cache is enabled), every saved block is kept in
+    # RAM AND persisted to SSD immediately — RAM-speed resume for recent
+    # sessions without losing SSD durability for old ones.
+    hot_cache_write_through: bool = False
+    # Reuse Apple's AOT-compiled ANE programs across server restarts
+    # (OMLX_QWEN35_ANE_COMPILE_CACHE=1). The native gate reads the env var
+    # once, at the first ANE compile, so a change applies on restart.
+    ane_compile_cache: bool = False
     paged_cache_block_size: int = 256  # Tokens per paged-cache block
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    # None selects the policy automatically: use an SSD sidecar when the SSD
+    # cache is enabled, otherwise keep GDN state embedded with the main cache.
+    # True/False preserve the legacy explicit split/embedded choices.
+    gdn_ssd_split_enabled: bool | None = None
+    gdn_ssd_pending_max_size: str = "512MB"
+    gdn_sidecar_state_dtype: str = "fp32"
+
+    def get_gdn_snapshot_storage(self) -> str:
+        """Return the user-facing GDN storage policy."""
+        if self.gdn_ssd_split_enabled is None:
+            return "auto"
+        if self.gdn_ssd_split_enabled is True:
+            return "ssd_sidecar"
+        if self.gdn_ssd_split_enabled is False:
+            return "embedded"
+        return str(self.gdn_ssd_split_enabled)
+
+    def set_gdn_snapshot_storage(self, mode: str) -> None:
+        """Set auto/ssd_sidecar/embedded while retaining legacy plumbing."""
+        normalized = str(mode).strip().lower()
+        if normalized == "auto":
+            self.gdn_ssd_split_enabled = None
+        elif normalized in {"ssd", "ssd_sidecar"}:
+            self.gdn_ssd_split_enabled = True
+        elif normalized in {"hot", "embedded"}:
+            self.gdn_ssd_split_enabled = False
+        else:
+            raise ValueError(
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
+            )
+
+    def get_gdn_ssd_split_enabled(self) -> bool:
+        """Resolve the effective low-level SSD-sidecar switch."""
+        if self.gdn_ssd_split_enabled is True:
+            return True
+        if self.gdn_ssd_split_enabled is False:
+            return False
+        if self.gdn_ssd_split_enabled is not None:
+            return False
+        return self.enabled and not self.hot_cache_only
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -337,9 +465,22 @@ class CacheSettings:
         return {
             "enabled": self.enabled,
             "hot_cache_only": self.hot_cache_only,
+            # Keep the legacy effective bool for older readers while the mode
+            # key lets current readers retain the auto policy across reloads.
+            "gdn_ssd_split_enabled": self.get_gdn_ssd_split_enabled(),
+            "gdn_snapshot_storage": self.get_gdn_snapshot_storage(),
+            "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
+            # This public key deliberately differs from the v0.6.0 key.
+            # v0.6.0 persisted its lossy rht_int16 default without recording
+            # whether the user selected it. Ignoring that legacy key resets
+            # every existing install to the exact fp32 default; reduced
+            # precision is retained only after an explicit new-key selection.
+            "gdn_sidecar_precision": self.gdn_sidecar_state_dtype,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
+            "hot_cache_write_through": self.hot_cache_write_through,
+            "ane_compile_cache": self.ane_compile_cache,
             "paged_cache_block_size": self.paged_cache_block_size,
             "initial_cache_blocks": self.initial_cache_blocks,
         }
@@ -347,76 +488,111 @@ class CacheSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CacheSettings:
         """Create from dictionary."""
+        hot_cache_max_size = data.get("hot_cache_max_size", "0")
+        if isinstance(hot_cache_max_size, str) and hot_cache_max_size.lower() == "auto":
+            hot_cache_max_size = "0"
+
+        storage_mode = data.get("gdn_snapshot_storage")
+        if storage_mode is None:
+            legacy_split = data.get("gdn_ssd_split_enabled")
+        else:
+            normalized_mode = str(storage_mode).strip().lower()
+            if normalized_mode == "auto":
+                legacy_split = None
+            elif normalized_mode in {"ssd", "ssd_sidecar"}:
+                legacy_split = True
+            elif normalized_mode in {"hot", "embedded"}:
+                legacy_split = False
+            else:
+                # Preserve the invalid value for validate() instead of making
+                # settings-file loading raise before a useful error is shown.
+                legacy_split = normalized_mode
+            legacy_value = data.get("gdn_ssd_split_enabled")
+            if (
+                normalized_mode != "auto"
+                and "gdn_ssd_split_enabled" in data
+                and legacy_value is not legacy_split
+            ):
+                legacy_split = "conflict"
+
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
+            gdn_ssd_split_enabled=legacy_split,
+            gdn_ssd_pending_max_size=data.get(
+                "gdn_ssd_pending_max_size", "512MB"
+            ),
+            gdn_sidecar_state_dtype=str(
+                data.get("gdn_sidecar_precision", "fp32")
+            ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
-            hot_cache_max_size=data.get("hot_cache_max_size", "0"),
+            hot_cache_max_size=hot_cache_max_size,
+            hot_cache_write_through=bool(
+                data.get("hot_cache_write_through", False)
+            ),
+            ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             paged_cache_block_size=data.get("paged_cache_block_size", 256),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
+
+
+MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
+VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"}
 
 
 @dataclass
 class MemorySettings:
     """Process-level memory enforcement settings."""
 
-    max_process_memory: str = "auto"  # "auto" (RAM - 8GB), "disabled", or "XX%"
-    prefill_memory_guard: bool = True  # Memory guard: prefill estimation + generation scheduling defer
-    # Two-stage watermark on max_process_memory. soft triggers admission pause + LRU eviction,
+    prefill_memory_guard: bool = (
+        True  # Memory guard: prefill estimation + generation scheduling defer
+    )
+    # Tier selects the active-memory reclaim ratio (safe/balanced/aggressive)
+    # or, for "custom", lets the user pin the dynamic ceiling to a fixed
+    # GB number. See ProcessMemoryEnforcer._get_dynamic_ceiling for the math.
+    memory_guard_tier: MemoryGuardTier = "balanced"
+    # Only consulted when memory_guard_tier == "custom". GB. 0 = unset.
+    memory_guard_custom_ceiling_gb: float = 0.0
+    # Two-stage watermark on the ceiling. soft triggers admission pause + LRU eviction,
     # hard triggers in-flight abort. Gap >= 10% absorbs macOS compressed-memory oscillation.
     soft_threshold: float = 0.85
     hard_threshold: float = 0.95
-
-    def get_max_process_memory_bytes(self) -> int | None:
-        """
-        Get max process memory in bytes, or None if disabled.
-
-        - "auto": system RAM minus 8GB
-        - "disabled": None (no enforcement)
-        - "XX%": percentage of system RAM (10-99%)
-
-        Returns:
-            Max process memory in bytes, or None if disabled.
-        """
-        value = self.max_process_memory.strip().lower()
-        if value == "disabled":
-            return None
-        if value == "auto":
-            total = get_system_memory()
-            reserve = _adaptive_system_reserve(total)
-            return total - reserve
-        # Parse percentage like "80%"
-        percent_str = value.rstrip("%")
-        try:
-            percent = int(percent_str)
-        except ValueError:
-            # Try parsing as absolute size (e.g., "32GB")
-            return parse_size(self.max_process_memory)
-        if not 10 <= percent <= 99:
-            raise ValueError(
-                f"max_process_memory must be 10-99%, got {percent}%"
-            )
-        return int(get_system_memory() * percent / 100)
+    # Adaptive prefill throttle. When current memory >= hard_cap * safe_zone_ratio
+    # the next chunk is sized so its predicted transient stays under the cap.
+    # If even prefill_min_chunk_tokens would exceed the cap, the request is
+    # aborted via the same cleanup path the hard-limit RuntimeError uses.
+    prefill_safe_zone_ratio: float = 0.80
+    prefill_min_chunk_tokens: int = 32
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "max_process_memory": self.max_process_memory,
             "prefill_memory_guard": self.prefill_memory_guard,
+            "memory_guard_tier": self.memory_guard_tier,
+            "memory_guard_custom_ceiling_gb": self.memory_guard_custom_ceiling_gb,
             "soft_threshold": self.soft_threshold,
             "hard_threshold": self.hard_threshold,
+            "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
+            "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MemorySettings:
         """Create from dictionary."""
+        tier = str(data.get("memory_guard_tier", "balanced")).lower()
+        if tier not in VALID_MEMORY_GUARD_TIERS:
+            tier = "balanced"
         return cls(
-            max_process_memory=data.get("max_process_memory", "auto"),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
+            memory_guard_tier=tier,  # type: ignore[arg-type]
+            memory_guard_custom_ceiling_gb=float(
+                data.get("memory_guard_custom_ceiling_gb", 0.0)
+            ),
             soft_threshold=float(data.get("soft_threshold", 0.85)),
             hard_threshold=float(data.get("hard_threshold", 0.95)),
+            prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
+            prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
         )
 
 
@@ -489,9 +665,7 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
-            sub_keys=[
-                SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
-            ],
+            sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
 
@@ -500,15 +674,19 @@ class MCPSettings:
     """MCP (Model Context Protocol) configuration settings."""
 
     config_path: str | None = None
+    expose_tools: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"config_path": self.config_path}
+        return {"config_path": self.config_path, "expose_tools": self.expose_tools}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MCPSettings:
         """Create from dictionary."""
-        return cls(config_path=data.get("config_path"))
+        return cls(
+            config_path=data.get("config_path"),
+            expose_tools=data.get("expose_tools", True),
+        )
 
 
 @dataclass
@@ -516,15 +694,22 @@ class HuggingFaceSettings:
     """HuggingFace Hub configuration settings."""
 
     endpoint: str = ""  # Empty string = use HF default (https://huggingface.co)
+    hf_cache_enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {"endpoint": self.endpoint}
+        return {
+            "endpoint": self.endpoint,
+            "hf_cache_enabled": self.hf_cache_enabled,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> HuggingFaceSettings:
         """Create from dictionary."""
-        return cls(endpoint=data.get("endpoint", ""))
+        return cls(
+            endpoint=data.get("endpoint", ""),
+            hf_cache_enabled=data.get("hf_cache_enabled", True),
+        )
 
 
 @dataclass
@@ -576,7 +761,18 @@ class NetworkSettings:
 class SamplingSettings:
     """Default sampling parameters for generation."""
 
+    # Fallback context length used by ``server.get_max_context_window``
+    # only when neither a per-model override nor a model-config
+    # discovered native context length is available. Default kept at
+    # 32768 so existing ``settings.json`` files carrying the historical
+    # default keep working unchanged after upgrade.
     max_context_window: int = 32768
+    # Optional operator policy cap. When set, the server returns
+    # ``min(native_context, max_context_window_policy)`` for models
+    # whose native context length is discovered. Unset (None) by
+    # default so no install behavior changes implicitly. Per-model
+    # overrides and the fallback default above are not affected.
+    max_context_window_policy: int | None = None
     max_tokens: int = 32768
     temperature: float = 1.0
     top_p: float = 0.95
@@ -587,6 +783,7 @@ class SamplingSettings:
         """Convert to dictionary."""
         return {
             "max_context_window": self.max_context_window,
+            "max_context_window_policy": self.max_context_window_policy,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -599,6 +796,7 @@ class SamplingSettings:
         """Create from dictionary."""
         return cls(
             max_context_window=data.get("max_context_window", 32768),
+            max_context_window_policy=data.get("max_context_window_policy"),
             max_tokens=data.get("max_tokens", 32768),
             temperature=data.get("temperature", 1.0),
             top_p=data.get("top_p", 0.95),
@@ -664,8 +862,6 @@ class UISettings:
 class ClaudeCodeSettings:
     """Claude Code integration settings."""
 
-    context_scaling_enabled: bool = False
-    target_context_size: int = 200000  # Claude Code default (200k)
     # Mode: "cloud" = native claude.ai subscription, "local" = route through omlx.
     # Default is "cloud" so upgrades don't silently route traffic to omlx.
     mode: str = "cloud"
@@ -676,8 +872,6 @@ class ClaudeCodeSettings:
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "context_scaling_enabled": self.context_scaling_enabled,
-            "target_context_size": self.target_context_size,
             "mode": self.mode,
             "opus_model": self.opus_model,
             "sonnet_model": self.sonnet_model,
@@ -688,8 +882,6 @@ class ClaudeCodeSettings:
     def from_dict(cls, data: dict[str, Any]) -> ClaudeCodeSettings:
         """Create from dictionary."""
         return cls(
-            context_scaling_enabled=data.get("context_scaling_enabled", False),
-            target_context_size=data.get("target_context_size", 200000),
             mode=data.get("mode", "cloud"),
             opus_model=data.get("opus_model"),
             sonnet_model=data.get("sonnet_model"),
@@ -699,7 +891,7 @@ class ClaudeCodeSettings:
 
 @dataclass
 class IntegrationSettings:
-    """Other integrations settings (Codex, OpenCode, OpenClaw, Hermes, Pi, Copilot)."""
+    """Other integrations settings."""
 
     codex_model: str | None = None
     opencode_model: str | None = None
@@ -708,6 +900,20 @@ class IntegrationSettings:
     pi_model: str | None = None
     copilot_model: str | None = None
     openclaw_tools_profile: str = "coding"
+    markitdown_enabled: bool = True
+    markitdown_expose_model: bool = False
+    markitdown_max_file_size_mb: int = 25
+    markitdown_max_files_per_request: int = 5
+    markitdown_pdf_processing_engine: str = "markitdown"
+    # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
+    web_search_provider: str = "ddgs"
+    web_search_brave_api_key: str = ""
+    web_search_searxng_url: str = ""
+    web_search_ddgs_backends: str = ""  # comma-separated, used by ddgs_custom
+    web_search_max_results: int = 3  # 1..10
+    web_search_content_mode: str = "snippet"  # "snippet" | "full"
+    web_search_content_truncate: bool = True
+    web_search_content_max_chars: int = 20000
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -719,6 +925,19 @@ class IntegrationSettings:
             "pi_model": self.pi_model,
             "copilot_model": self.copilot_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
+            "markitdown_enabled": self.markitdown_enabled,
+            "markitdown_expose_model": self.markitdown_expose_model,
+            "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
+            "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
+            "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
+            "web_search_provider": self.web_search_provider,
+            "web_search_brave_api_key": self.web_search_brave_api_key,
+            "web_search_searxng_url": self.web_search_searxng_url,
+            "web_search_ddgs_backends": self.web_search_ddgs_backends,
+            "web_search_max_results": self.web_search_max_results,
+            "web_search_content_mode": self.web_search_content_mode,
+            "web_search_content_truncate": self.web_search_content_truncate,
+            "web_search_content_max_chars": self.web_search_content_max_chars,
         }
 
     @classmethod
@@ -732,6 +951,27 @@ class IntegrationSettings:
             pi_model=data.get("pi_model"),
             copilot_model=data.get("copilot_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
+            markitdown_enabled=data.get("markitdown_enabled", True),
+            markitdown_expose_model=data.get("markitdown_expose_model", False),
+            markitdown_max_file_size_mb=data.get("markitdown_max_file_size_mb", 25),
+            markitdown_max_files_per_request=data.get(
+                "markitdown_max_files_per_request", 5
+            ),
+            markitdown_pdf_processing_engine=data.get(
+                "markitdown_pdf_processing_engine", "markitdown"
+            ),
+            web_search_provider=data.get("web_search_provider", "ddgs"),
+            web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
+            web_search_searxng_url=data.get("web_search_searxng_url", ""),
+            web_search_ddgs_backends=data.get("web_search_ddgs_backends", ""),
+            web_search_max_results=data.get("web_search_max_results", 3),
+            web_search_content_mode=data.get("web_search_content_mode", "snippet"),
+            web_search_content_truncate=data.get(
+                "web_search_content_truncate", True
+            ),
+            web_search_content_max_chars=data.get(
+                "web_search_content_max_chars", 20000
+            ),
         )
 
 
@@ -752,7 +992,10 @@ class GlobalSettings:
     model: ModelSettings = field(default_factory=ModelSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
-    slot_save_path: Optional[str] = None
+    # Directory backing the slot save/restore feature (save-handle). None
+    # disables saving slots; see validate() for the writability + single
+    # concurrency preconditions.
+    slot_save_path: str | None = None
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
@@ -764,7 +1007,9 @@ class GlobalSettings:
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
-    idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
+    idle_timeout: ModelIdleTimeoutSettings = field(
+        default_factory=ModelIdleTimeoutSettings
+    )
 
     @classmethod
     def load(
@@ -776,7 +1021,9 @@ class GlobalSettings:
         Load settings with priority hierarchy: CLI > env > file > defaults.
 
         Args:
-            base_path: Base directory for oMLX (default: ~/.omlx).
+            base_path: Base directory for oMLX (default: resolved via
+                OMLX_BASE_PATH env var, the macOS app's bootstrap file,
+                then ~/.omlx).
             cli_args: Argparse namespace with CLI arguments.
 
         Returns:
@@ -786,7 +1033,7 @@ class GlobalSettings:
         if base_path:
             resolved_base = Path(base_path).expanduser().resolve()
         else:
-            resolved_base = DEFAULT_BASE_PATH
+            resolved_base = resolve_default_base_path()
 
         # Start with defaults
         settings = cls(base_path=resolved_base)
@@ -855,16 +1102,33 @@ class GlobalSettings:
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
             if "integrations" in data:
-                self.integrations = IntegrationSettings.from_dict(
-                    data["integrations"]
-                )
+                self.integrations = IntegrationSettings.from_dict(data["integrations"])
             if "ui" in data:
                 self.ui = UISettings.from_dict(data["ui"])
             if "idle_timeout" in data:
-                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(data["idle_timeout"])
+                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
+                    data["idle_timeout"]
+                )
 
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse settings file {path}: {e}")
+            # A corrupt settings file silently reverting the server to
+            # defaults is security-relevant (auth.api_key lives here), so
+            # preserve the evidence and be loud instead of a debug-level shrug.
+            backup = path.with_name(
+                f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            )
+            try:
+                os.replace(path, backup)
+                logger.error(
+                    f"Settings file {path} is corrupt ({e}); moved it to "
+                    f"{backup} and continuing with defaults. Restore it or "
+                    "reconfigure, otherwise API-key auth may be disabled."
+                )
+            except OSError:
+                logger.error(
+                    f"Settings file {path} is corrupt ({e}) and could not be "
+                    "moved aside; continuing with defaults."
+                )
         except OSError as e:
             logger.warning(f"Failed to read settings file {path}: {e}")
 
@@ -880,19 +1144,18 @@ class GlobalSettings:
                 logger.warning(f"Invalid OMLX_PORT value: {port}")
         if log_level := os.getenv("OMLX_LOG_LEVEL"):
             self.server.log_level = log_level
+        if preserve_mid_system_cache := os.getenv("OMLX_PRESERVE_MID_SYSTEM_CACHE"):
+            self.server.preserve_mid_system_cache = (
+                preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if max_audio_upload_size := os.getenv("OMLX_MAX_AUDIO_UPLOAD_SIZE"):
+            self.server.max_audio_upload_size = max_audio_upload_size
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
             dirs = [d.strip() for d in model_dir.split(",") if d.strip()]
             self.model.model_dirs = dirs
             self.model.model_dir = dirs[0] if dirs else None
-        if max_model_memory := os.getenv("OMLX_MAX_MODEL_MEMORY"):
-            self.model.max_model_memory = max_model_memory
-
-        # Memory enforcement settings
-        if max_process_memory := os.getenv("OMLX_MAX_PROCESS_MEMORY"):
-            self.memory.max_process_memory = max_process_memory
-
         # Scheduler settings
         max_concurrent = os.getenv("OMLX_MAX_CONCURRENT_REQUESTS") or os.getenv(
             "OMLX_MAX_NUM_SEQS"
@@ -904,6 +1167,14 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_MAX_CONCURRENT_REQUESTS value: {max_concurrent}"
                 )
+        if embedding_batch_size := os.getenv("OMLX_EMBEDDING_BATCH_SIZE"):
+            try:
+                self.scheduler.embedding_batch_size = int(embedding_batch_size)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
+                )
+        # Slot save/restore (save-handle) storage root.
         if slot_save_path := os.getenv("OMLX_SLOT_SAVE_PATH"):
             self.slot_save_path = slot_save_path
 
@@ -916,6 +1187,27 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
+        if hot_cache_wt := os.getenv("OMLX_HOT_CACHE_WRITE_THROUGH"):
+            self.cache.hot_cache_write_through = hot_cache_wt.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if gdn_storage := os.getenv("OMLX_GDN_SNAPSHOT_STORAGE"):
+            try:
+                self.cache.set_gdn_snapshot_storage(gdn_storage)
+            except ValueError as exc:
+                logger.warning(str(exc))
+        elif gdn_ssd_split := os.getenv("OMLX_GDN_SSD_SPLIT_ENABLED"):
+            self.cache.gdn_ssd_split_enabled = gdn_ssd_split.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
+            self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
+        if gdn_sidecar_dtype := os.getenv("OMLX_GDN_SIDECAR_STATE_DTYPE"):
+            self.cache.gdn_sidecar_state_dtype = gdn_sidecar_dtype.lower()
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -928,7 +1220,8 @@ class GlobalSettings:
                 self.cache.paged_cache_block_size = int(paged_block_size)
             except ValueError:
                 logger.warning(
-                    f"Invalid OMLX_PAGED_CACHE_BLOCK_SIZE value: {paged_block_size}"
+                    "Invalid OMLX_PAGED_CACHE_BLOCK_SIZE value: "
+                    f"{paged_block_size}"
                 )
 
         # Auth settings
@@ -942,6 +1235,13 @@ class GlobalSettings:
         # HuggingFace settings
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
             self.huggingface.endpoint = hf_endpoint
+        if hf_cache_enabled := os.getenv("OMLX_HF_CACHE_ENABLED"):
+            self.huggingface.hf_cache_enabled = hf_cache_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         # ModelScope settings
         if ms_endpoint := os.getenv("OMLX_MS_ENDPOINT"):
@@ -966,7 +1266,23 @@ class GlobalSettings:
             except ValueError:
                 logger.warning(f"Invalid OMLX_LOG_RETENTION_DAYS: {retention_days}")
 
-    def _apply_cli_overrides(self, args: Any) -> None:
+        # Integration settings
+        if markitdown_enabled := os.getenv("OMLX_MARKITDOWN_ENABLED"):
+            self.integrations.markitdown_enabled = (
+                markitdown_enabled.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if markitdown_expose_model := os.getenv("OMLX_MARKITDOWN_EXPOSE_MODEL"):
+            self.integrations.markitdown_expose_model = (
+                markitdown_expose_model.strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if markitdown_pdf_processing_engine := os.getenv(
+            "OMLX_MARKITDOWN_PDF_PROCESSING_ENGINE"
+        ):
+            self.integrations.markitdown_pdf_processing_engine = (
+                markitdown_pdf_processing_engine.strip() or "markitdown"
+            )
+
+    def _apply_cli_overrides(self, args: Any, *, include_api_key: bool = True) -> None:
         """
         Apply CLI argument overrides.
 
@@ -982,35 +1298,35 @@ class GlobalSettings:
             self.server.log_level = args.log_level
         if hasattr(args, "sse_keepalive_mode") and args.sse_keepalive_mode is not None:
             self.server.sse_keepalive_mode = args.sse_keepalive_mode
+        if (
+            hasattr(args, "max_audio_upload_size")
+            and args.max_audio_upload_size is not None
+        ):
+            self.server.max_audio_upload_size = args.max_audio_upload_size
 
         # Model settings
         if hasattr(args, "model_dir") and args.model_dir is not None:
             dirs = [d.strip() for d in args.model_dir.split(",") if d.strip()]
             self.model.model_dirs = dirs
             self.model.model_dir = dirs[0] if dirs else None
-        if hasattr(args, "max_model_memory") and args.max_model_memory is not None:
-            self.model.max_model_memory = args.max_model_memory
-
-        # Memory enforcement settings
-        if (
-            hasattr(args, "max_process_memory")
-            and args.max_process_memory is not None
-        ):
-            self.memory.max_process_memory = args.max_process_memory
-
         # Scheduler settings
         if (
             hasattr(args, "max_concurrent_requests")
             and args.max_concurrent_requests is not None
         ):
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
-        if hasattr(args, "slot_save_path") and args.slot_save_path is not None:
-            self.slot_save_path = args.slot_save_path
+        if (
+            hasattr(args, "embedding_batch_size")
+            and args.embedding_batch_size is not None
+        ):
+            self.scheduler.embedding_batch_size = args.embedding_batch_size
         if (
             hasattr(args, "max_completion_batch_size")
             and args.max_completion_batch_size is not None
         ):
-            self.scheduler.max_completion_batch_size = args.max_completion_batch_size
+            self.scheduler.max_completion_batch_size = (
+                args.max_completion_batch_size
+            )
         if (
             hasattr(args, "per_model_max_concurrent")
             and args.per_model_max_concurrent is not None
@@ -1041,7 +1357,10 @@ class GlobalSettings:
                         ) from e
             self.scheduler.per_model_max_concurrent = parsed
         for attr_name, flag_label in (
-            ("per_model_max_completion_batch_size", "--per-model-max-completion-batch-size"),
+            (
+                "per_model_max_completion_batch_size",
+                "--per-model-max-completion-batch-size",
+            ),
             ("per_model_prefill_step_size", "--per-model-prefill-step-size"),
         ):
             if hasattr(args, attr_name) and getattr(args, attr_name) is not None:
@@ -1069,13 +1388,50 @@ class GlobalSettings:
                             ) from e
                 setattr(self.scheduler, attr_name, parsed_dict)
 
+        # Slot save/restore (save-handle) storage root.
+        if hasattr(args, "slot_save_path") and args.slot_save_path is not None:
+            self.slot_save_path = args.slot_save_path
+
+        # Memory guard settings. Naming a tier or a ceiling on the command
+        # line also turns the guard on. With a saved
+        # ``prefill_memory_guard: false`` these flags used to be a silent
+        # no-op — the enforcer reports a ceiling of 0 with the guard off, so
+        # the tier the user asked for governed nothing.
+        if hasattr(args, "memory_guard") and args.memory_guard is not None:
+            if args.memory_guard == "off":
+                self.memory.prefill_memory_guard = False
+            else:
+                self.memory.memory_guard_tier = args.memory_guard
+                self.memory.prefill_memory_guard = True
+        if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
+            self.memory.memory_guard_tier = "custom"
+            self.memory.memory_guard_custom_ceiling_gb = float(args.memory_guard_gb)
+            self.memory.prefill_memory_guard = True
+
         # Cache settings
         if hasattr(args, "cache_enabled") and args.cache_enabled is not None:
             self.cache.enabled = args.cache_enabled
-        if hasattr(args, "ssd_cache_dir") and args.ssd_cache_dir is not None:
-            self.cache.ssd_cache_dir = args.ssd_cache_dir
-        if hasattr(args, "ssd_cache_max_size") and args.ssd_cache_max_size is not None:
-            self.cache.ssd_cache_max_size = args.ssd_cache_max_size
+
+        # ``paged_ssd_cache_*`` are the public CLI names. Keep the older
+        # internal names as fallbacks for callers that still build a namespace
+        # directly.
+        paged_cache_dir = getattr(args, "paged_ssd_cache_dir", None)
+        if paged_cache_dir is not None:
+            self.cache.ssd_cache_dir = paged_cache_dir
+            self.cache.enabled = True
+        elif (cache_dir := getattr(args, "ssd_cache_dir", None)) is not None:
+            self.cache.ssd_cache_dir = cache_dir
+
+        cache_max_size = getattr(args, "paged_ssd_cache_max_size", None)
+        if cache_max_size is None:
+            cache_max_size = getattr(args, "ssd_cache_max_size", None)
+        if cache_max_size is not None:
+            self.cache.ssd_cache_max_size = cache_max_size
+
+        if hasattr(args, "hot_cache_max_size") and args.hot_cache_max_size is not None:
+            self.cache.hot_cache_max_size = args.hot_cache_max_size
+        if getattr(args, "hot_cache_write_through", None) is not None:
+            self.cache.hot_cache_write_through = bool(args.hot_cache_write_through)
         if (
             hasattr(args, "initial_cache_blocks")
             and args.initial_cache_blocks is not None
@@ -1086,9 +1442,11 @@ class GlobalSettings:
             and args.paged_cache_block_size is not None
         ):
             self.cache.paged_cache_block_size = args.paged_cache_block_size
+        if getattr(args, "no_cache", False):
+            self.cache.enabled = False
 
         # Auth settings
-        if hasattr(args, "api_key") and args.api_key is not None:
+        if include_api_key and hasattr(args, "api_key") and args.api_key is not None:
             self.auth.api_key = args.api_key
 
         # MCP settings
@@ -1098,6 +1456,8 @@ class GlobalSettings:
         # HuggingFace settings
         if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
             self.huggingface.endpoint = args.hf_endpoint
+        if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
+            self.huggingface.hf_cache_enabled = args.hf_cache_enabled
 
         # ModelScope settings
         if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
@@ -1112,6 +1472,45 @@ class GlobalSettings:
             self.network.no_proxy = args.no_proxy
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
+
+    def get_hf_cache_dir(self) -> Path:
+        """Return the standard HuggingFace Hub cache directory."""
+        if hf_hub_cache := os.getenv("HF_HUB_CACHE"):
+            return Path(hf_hub_cache).expanduser().resolve()
+        if hf_home := os.getenv("HF_HOME"):
+            return (Path(hf_home).expanduser() / "hub").resolve()
+        return (Path.home() / ".cache" / "huggingface" / "hub").resolve()
+
+    def get_effective_model_dirs(
+        self, model_dirs: list[str] | None = None
+    ) -> list[Path]:
+        """Return model directories in discovery order, including HF cache."""
+        if model_dirs is None:
+            configured = self.model.get_model_dirs(self.base_path)
+        elif model_dirs:
+            configured = [Path(d).expanduser().resolve() for d in model_dirs]
+        else:
+            configured = [self.base_path / "models"]
+        effective: list[Path] = []
+        seen: set[Path] = set()
+
+        def add(path: Path, *, require_exists: bool = False) -> None:
+            resolved = path.expanduser().resolve()
+            if require_exists and not resolved.exists():
+                return
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            effective.append(resolved)
+
+        if configured:
+            add(configured[0])
+        if self.huggingface.hf_cache_enabled:
+            add(self.get_hf_cache_dir(), require_exists=True)
+        for directory in configured[1:]:
+            add(directory)
+
+        return effective
 
     def save(self) -> None:
         """Save current settings to the settings file."""
@@ -1144,16 +1543,44 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        # Write to a temp file and rename so a crash or a concurrent
+        # writer can never leave a torn settings.json (same pattern as
+        # ModelSettingsManager._save). The rename also carries the temp
+        # file's 0o600 mode onto the destination. The temp name embeds the
+        # pid: with a shared name, two processes saving at once interleave
+        # inside the same temp file and the rename publishes the mix.
+        temp_file = settings_file.with_name(
+            f"{settings_file.name}.{os.getpid()}.tmp"
+        )
         try:
-            with open(settings_file, "w", encoding="utf-8") as f:
+            with os.fdopen(
+                os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, settings_file)
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
+            temp_file.unlink(missing_ok=True)
             raise
+
+    def save_cli_overrides(self, args: Any) -> None:
+        """Persist explicit non-secret CLI configuration without freezing env state."""
+        persisted = type(self)(base_path=self.base_path)
+        settings_file = self.base_path / "settings.json"
+        if settings_file.exists():
+            persisted._load_from_file(settings_file)
+        persisted._apply_cli_overrides(args, include_api_key=False)
+        persisted.save()
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
+        from .model_discovery import model_directory_access_error
+
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
@@ -1173,17 +1600,22 @@ class GlobalSettings:
         # Model directories - skip unavailable paths (e.g. disconnected external drive)
         valid_dirs = []
         for directory in self.model.get_model_dirs(self.base_path):
-            if directory.exists():
-                valid_dirs.append(str(directory))
+            if not directory.exists():
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    logger.debug(f"Created directory: {directory}")
+                except OSError as e:
+                    logger.warning(
+                        f"Model directory unavailable, skipping: {directory} ({e})"
+                    )
+                    continue
+
+            access_error = model_directory_access_error(directory)
+            if access_error is not None:
+                logger.warning(f"Model directory unavailable, skipping: {access_error}")
                 continue
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"Created directory: {directory}")
-                valid_dirs.append(str(directory))
-            except OSError as e:
-                logger.warning(
-                    f"Model directory unavailable, skipping: {directory} ({e})"
-                )
+
+            valid_dirs.append(str(directory))
 
         # Update model_dirs to only include valid paths
         self.model.model_dirs = valid_dirs
@@ -1200,9 +1632,7 @@ class GlobalSettings:
 
         # Server validation
         if not 1 <= self.server.port <= 65535:
-            errors.append(
-                f"Invalid port: {self.server.port} (must be 1-65535)"
-            )
+            errors.append(f"Invalid port: {self.server.port} (must be 1-65535)")
 
         valid_log_levels = {"trace", "debug", "info", "warning", "error", "critical"}
         if self.server.log_level.lower() not in valid_log_levels:
@@ -1218,33 +1648,40 @@ class GlobalSettings:
                 f"(must be one of {valid_keepalive_modes})"
             )
 
-        # Model validation
-        if self.model.max_model_memory.lower() not in ("auto", "disabled"):
-            try:
-                size = parse_size(self.model.max_model_memory)
-                if size <= 0:
-                    errors.append("max_model_memory must be positive")
-            except ValueError as e:
-                errors.append(f"Invalid max_model_memory: {e}")
+        try:
+            audio_upload_size = parse_size(self.server.max_audio_upload_size)
+            if audio_upload_size <= 0:
+                errors.append("max_audio_upload_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_audio_upload_size: {e}")
 
-        # Memory enforcement validation
-        mem_val = self.memory.max_process_memory.strip().lower()
-        if mem_val not in ("auto", "disabled"):
-            percent_str = mem_val.rstrip("%")
-            try:
-                percent = int(percent_str)
-                if not 10 <= percent <= 99:
-                    errors.append(
-                        f"max_process_memory must be 10-99%, got {percent}%"
-                    )
-            except ValueError:
-                # Could be absolute size, try parsing
-                try:
-                    size = parse_size(self.memory.max_process_memory)
-                    if size <= 0:
-                        errors.append("max_process_memory must be positive")
-                except ValueError as e:
-                    errors.append(f"Invalid max_process_memory: {e}")
+        # Memory guard tier validation
+        if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:
+            errors.append(
+                f"Invalid memory_guard_tier: {self.memory.memory_guard_tier} "
+                f"(must be one of {sorted(VALID_MEMORY_GUARD_TIERS)})"
+            )
+
+        # Custom ceiling must be > 0 when tier == "custom"
+        if (
+            self.memory.memory_guard_tier == "custom"
+            and self.memory.memory_guard_custom_ceiling_gb <= 0
+        ):
+            errors.append(
+                "memory_guard_custom_ceiling_gb must be > 0 when "
+                "memory_guard_tier is 'custom'"
+            )
+
+        if not 0.5 <= self.memory.prefill_safe_zone_ratio <= 0.99:
+            errors.append(
+                f"prefill_safe_zone_ratio must be in [0.5, 0.99], "
+                f"got {self.memory.prefill_safe_zone_ratio}"
+            )
+        if not 1 <= self.memory.prefill_min_chunk_tokens <= 1024:
+            errors.append(
+                f"prefill_min_chunk_tokens must be in [1, 1024], "
+                f"got {self.memory.prefill_min_chunk_tokens}"
+            )
 
         # Scheduler validation
         if self.scheduler.max_concurrent_requests <= 0:
@@ -1252,6 +1689,13 @@ class GlobalSettings:
                 f"Invalid max_concurrent_requests: "
                 f"{self.scheduler.max_concurrent_requests} (must be > 0)"
             )
+        if self.scheduler.embedding_batch_size <= 0:
+            errors.append(
+                f"Invalid embedding_batch_size: "
+                f"{self.scheduler.embedding_batch_size} (must be > 0)"
+            )
+
+        # Slot save/restore (save-handle) preconditions.
         if self.slot_save_path:
             slot_path = Path(self.slot_save_path).expanduser().resolve()
             try:
@@ -1277,13 +1721,49 @@ class GlobalSettings:
                     str(model_dirs[0])
                 )
 
-            if requires_single_concurrency and self.scheduler.max_concurrent_requests != 1:
+            if (
+                requires_single_concurrency
+                and self.scheduler.max_concurrent_requests != 1
+            ):
                 errors.append(
                     "slot_save_path requires max_concurrent_requests=1 "
                     f"(got {self.scheduler.max_concurrent_requests})"
                 )
 
         # Cache validation
+        if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
+            errors.append(
+                "gdn_ssd_split_enabled cannot be used with hot_cache_only"
+            )
+
+        try:
+            gdn_pending_size = parse_size(self.cache.gdn_ssd_pending_max_size)
+            if gdn_pending_size <= 0:
+                errors.append("gdn_ssd_pending_max_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid gdn_ssd_pending_max_size: {e}")
+
+        if self.cache.gdn_sidecar_state_dtype not in {
+            "fp32",
+            "bf16",
+            "int8",
+            "rht_int8",
+            "rht_int16",
+        }:
+            errors.append(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8, rht_int16"
+            )
+        if not (
+            self.cache.gdn_ssd_split_enabled is None
+            or self.cache.gdn_ssd_split_enabled is True
+            or self.cache.gdn_ssd_split_enabled is False
+        ):
+            errors.append(
+                "gdn_snapshot_storage must be one of: "
+                "auto, ssd_sidecar, embedded"
+            )
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -1291,6 +1771,19 @@ class GlobalSettings:
                     errors.append("ssd_cache_max_size must be positive")
             except ValueError as e:
                 errors.append(f"Invalid ssd_cache_max_size: {e}")
+
+        try:
+            hot_cache_size = parse_size(self.cache.hot_cache_max_size)
+            if hot_cache_size < 0:
+                errors.append("hot_cache_max_size must be non-negative")
+        except ValueError as e:
+            if self.cache.hot_cache_max_size.strip().lower() == "auto":
+                errors.append(
+                    "Invalid hot_cache_max_size: 'auto' is not supported; "
+                    "use '0' to disable or a size like '8GB'"
+                )
+            else:
+                errors.append(f"Invalid hot_cache_max_size: {e}")
 
         if self.cache.initial_cache_blocks <= 0:
             errors.append(
@@ -1310,6 +1803,14 @@ class GlobalSettings:
             )
 
         # Sampling validation
+        if (
+            self.sampling.max_context_window_policy is not None
+            and self.sampling.max_context_window_policy <= 0
+        ):
+            errors.append(
+                "Invalid sampling max_context_window_policy: "
+                f"{self.sampling.max_context_window_policy} (must be > 0)"
+            )
         if self.sampling.max_tokens <= 0:
             errors.append(
                 f"Invalid sampling max_tokens: {self.sampling.max_tokens} (must be > 0)"
@@ -1329,17 +1830,20 @@ class GlobalSettings:
             )
 
         # Claude Code validation
-        if self.claude_code.target_context_size <= 0:
-            errors.append(
-                f"Invalid target_context_size: "
-                f"{self.claude_code.target_context_size} (must be > 0)"
-            )
         valid_modes = {"local", "cloud"}
         if self.claude_code.mode not in valid_modes:
             errors.append(
                 f"Invalid claude_code mode: '{self.claude_code.mode}' "
                 f"(must be one of {sorted(valid_modes)})"
             )
+
+        # Integration validation
+        if self.integrations.markitdown_max_file_size_mb <= 0:
+            errors.append("markitdown_max_file_size_mb must be > 0")
+        if self.integrations.markitdown_max_files_per_request <= 0:
+            errors.append("markitdown_max_files_per_request must be > 0")
+        if not str(self.integrations.markitdown_pdf_processing_engine or "").strip():
+            errors.append("markitdown_pdf_processing_engine must not be empty")
 
         # HuggingFace validation
         if self.huggingface.endpoint:
@@ -1389,7 +1893,9 @@ class GlobalSettings:
         # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
-        ssd_dir = self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        ssd_dir = (
+            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        )
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
@@ -1398,14 +1904,27 @@ class GlobalSettings:
                 if self.scheduler.max_completion_batch_size is not None
                 else self.scheduler.max_concurrent_requests
             ),
+            embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
+            prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
+            decode_fairness=self.scheduler.decode_fairness,
             paged_cache_block_size=self.cache.paged_cache_block_size,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
-            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(self.base_path),
+            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
+                self.base_path
+            ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
-            per_model_max_concurrent=dict(self.scheduler.per_model_max_concurrent),
+            hot_cache_write_through=self.cache.hot_cache_write_through,
+            gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
+            gdn_ssd_pending_max_bytes=parse_size(
+                self.cache.gdn_ssd_pending_max_size
+            ),
+            gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            per_model_max_concurrent=dict(
+                self.scheduler.per_model_max_concurrent
+            ),
             per_model_max_completion_batch_size=dict(
                 self.scheduler.per_model_max_completion_batch_size
             ),
@@ -1455,9 +1974,7 @@ def get_settings() -> GlobalSettings:
     """
     global _global_settings
     if _global_settings is None:
-        raise RuntimeError(
-            "Settings not initialized. Call init_settings() first."
-        )
+        raise RuntimeError("Settings not initialized. Call init_settings() first.")
     return _global_settings
 
 
@@ -1469,7 +1986,9 @@ def init_settings(
     Initialize global settings (call once at startup).
 
     Args:
-        base_path: Base directory for oMLX (default: ~/.omlx).
+        base_path: Base directory for oMLX (default: resolved via
+                OMLX_BASE_PATH env var, the macOS app's bootstrap file,
+                then ~/.omlx).
         cli_args: Argparse namespace with CLI arguments.
 
     Returns:

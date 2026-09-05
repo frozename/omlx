@@ -32,6 +32,15 @@ logger = logging.getLogger(__name__)
 # Default fallback value for all memory functions (conservative)
 DEFAULT_MEMORY_BYTES = 8 * 1024 * 1024 * 1024  # 8GB
 
+# Absolute paths to the macOS system tools we shell out to. They live in
+# /usr/sbin, which is not on PATH in some headless launchd contexts (e.g.
+# `brew services`). Looking them up by name there raises FileNotFoundError and
+# silently degrades detection (chip falls back to M1, gpu/uuid to None), so we
+# always invoke them by absolute path. See issue #1322.
+_SYSCTL = "/usr/sbin/sysctl"
+_SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+_IOREG = "/usr/sbin/ioreg"
+
 
 @dataclass
 class HardwareInfo:
@@ -57,7 +66,7 @@ def get_chip_name() -> str:
     """
     try:
         result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            [_SYSCTL, "-n", "machdep.cpu.brand_string"],
             capture_output=True,
             text=True,
             check=True,
@@ -82,7 +91,7 @@ def get_total_memory_bytes() -> int:
     # Primary: sysctl
     try:
         result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
+            [_SYSCTL, "-n", "hw.memsize"],
             capture_output=True,
             text=True,
             check=True,
@@ -117,7 +126,7 @@ def get_max_working_set_bytes() -> int:
 
     Fallback chain:
     1. mlx.metal.device_info()["max_recommended_working_set_size"]
-    2. psutil.virtual_memory().total * 0.75
+    2. total system memory * 0.75
     3. DEFAULT_MEMORY_BYTES (8GB)
 
     Returns:
@@ -134,14 +143,9 @@ def get_max_working_set_bytes() -> int:
         except Exception:
             pass
 
-    # Fallback: psutil with 75% heuristic
-    try:
-        import psutil
-
-        total_ram = psutil.virtual_memory().total
+    total_ram = get_total_memory_bytes()
+    if total_ram > 0:
         return int(total_ram * 0.75)
-    except ImportError:
-        pass
 
     # Last resort: default
     logger.warning(
@@ -209,6 +213,10 @@ def is_mlx_available() -> bool:
 
 def get_mlx_version() -> str:
     """Get MLX version string."""
+    if HAS_MLX:
+        core_version = getattr(mx, "__version__", None)
+        if core_version:
+            return str(core_version)
     try:
         import mlx
 
@@ -248,7 +256,7 @@ def get_gpu_core_count() -> Optional[int]:
     """Get GPU core count via system_profiler."""
     try:
         result = subprocess.run(
-            ["system_profiler", "SPDisplaysDataType"],
+            [_SYSTEM_PROFILER, "SPDisplaysDataType"],
             capture_output=True,
             text=True,
             check=True,
@@ -267,7 +275,7 @@ def get_io_platform_uuid() -> Optional[str]:
     """Get IOPlatformUUID from ioreg (unique per device)."""
     try:
         result = subprocess.run(
-            ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+            [_IOREG, "-rd1", "-c", "IOPlatformExpertDevice"],
             capture_output=True,
             text=True,
             check=True,

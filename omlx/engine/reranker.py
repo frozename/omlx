@@ -85,10 +85,14 @@ class RerankerEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping reranker engine: {self._model_name}")
+        model = self._model
+        loop = asyncio.get_running_loop()
+        close = getattr(model, "close", None)
+        if callable(close):
+            await loop.run_in_executor(get_mlx_executor(), close)
         self._model = None
 
         gc.collect()
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
@@ -154,12 +158,7 @@ class RerankerEngine(BaseNonStreamingEngine):
 
             return output
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+            await self._finish_activity(activity_id)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
