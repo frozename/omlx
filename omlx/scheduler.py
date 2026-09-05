@@ -10177,6 +10177,7 @@ class Scheduler:
         cached_tokens: int,
         current: int,
         text_only: bool = False,
+        cached_kv_resident: bool = True,
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
@@ -10226,8 +10227,18 @@ class Scheduler:
             return None
         floor_chunk = min(charge_tokens, prefill_tokens)
         kv_len = max(int(num_prompt_tokens) - 1 - floor_chunk, 0)
+        # Route-time preflight charges the cached prefix as resident-to-be
+        # KV (num_prompt_tokens) because the stored blocks have not been
+        # materialized yet; the in-stream re-check keeps the default and
+        # charges only new_tokens since _prepare_prefix_cache_for_request
+        # has already loaded the hit.
+        charge_kv_tokens = (
+            num_prompt_tokens if not cached_kv_resident else new_tokens
+        )
         kv_exact = int(
-            monitor.estimate_resident_kv_bytes(new_tokens, chunk_tokens=floor_chunk)
+            monitor.estimate_resident_kv_bytes(
+                charge_kv_tokens, chunk_tokens=floor_chunk
+            )
         )
         gathered_core = self._qwen4_text_gathered_pricing(text_only)
         transient = int(
@@ -10320,6 +10331,7 @@ class Scheduler:
             cached_tokens=cached_tokens,
             current=current,
             text_only=text_only,
+            cached_kv_resident=False,
         )
         if est is None:
             return
@@ -10405,6 +10417,7 @@ class Scheduler:
             cached_tokens=cached_tokens,
             current=current,
             text_only=text_only,
+            cached_kv_resident=False,
         )
         if est is None:
             return None

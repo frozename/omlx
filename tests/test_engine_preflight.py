@@ -102,7 +102,7 @@ class TestPreflightOrRaise:
         # Even with an impossibly small limit, disabled guard never raises.
         scheduler.preflight_or_raise(num_prompt_tokens=10**6)
 
-    def test_accounts_for_cached_tokens(self, monkeypatch):
+    def test_accounts_for_cached_tokens(self, monkeypatch, caplog):
         """A fully cached request must not be rejected even at a tiny limit."""
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = True
@@ -114,6 +114,18 @@ class TestPreflightOrRaise:
         monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
 
         scheduler.preflight_or_raise(num_prompt_tokens=10_000, cached_tokens=10_000)
+
+        # A partial-cache rejection must log the credited cached_tokens so
+        # the operator can distinguish a cold prefill rejection from a
+        # cache-hit-continuation that was still over-budget.
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+            with pytest.raises(PrefillMemoryExceededError):
+                scheduler.preflight_or_raise(
+                    num_prompt_tokens=10_000, cached_tokens=5000
+                )
+        assert "cached=5000" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -182,11 +194,13 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
         num_prompt_tokens=123,
         request_id="req-evict",
         text_only=True,
+        cached_tokens=0,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
         text_only=True,
+        cached_tokens=0,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -232,6 +246,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
         num_prompt_tokens=60_000,
         request_id="req-next",
         text_only=True,
+        cached_tokens=0,
     )
     evict.assert_not_awaited()
 
@@ -649,6 +664,66 @@ async def test_batched_engine_preflight_chat_threads_request_id(monkeypatch):
         request_id="trace-id-42",
     )
     assert seen.get("request_id") == "trace-id-42"
+
+
+@pytest.mark.asyncio
+async def test_batched_engine_preflight_chat_credits_cached_prefix():
+    """preflight_chat must credit the stored prefix so a cache
+    hit-continuation is not priced as a cold prefill at HTTP time.
+
+    The engine calls ``scheduler.estimate_cached_prefix_tokens(token_ids)``
+    with the *encoded ids* (not the count) and forwards the result as
+    ``cached_tokens`` to both ``preflight_eviction_request`` and
+    ``preflight_or_raise``.  The estimate is read-only: it must NOT call
+    ``block_aware_cache.fetch_cache`` (which allocates and registers state).
+
+    Fail-closed: if the estimate raises, ``cached_tokens`` falls back to 0
+    so the request is priced cold — same as today — never under-priced.
+    """
+    from omlx.engine.batched import BatchedEngine
+
+    token_ids = [10, 20, 30, 40, 50]
+    scheduler = MagicMock()
+    scheduler.estimate_cached_prefix_tokens = MagicMock(return_value=8)
+    scheduler.preflight_eviction_request = MagicMock(return_value=None)
+    scheduler.preflight_or_raise = MagicMock()
+    scheduler.block_aware_cache = MagicMock()
+
+    engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+    engine._preprocess_messages = lambda m: m
+    engine._tokenizer.encode = MagicMock(return_value=token_ids)
+
+    await engine.preflight_chat(
+        messages=[{"role": "user", "content": "x"}],
+        request_id="req-credit",
+    )
+
+    # The probe received the raw token ids, not the count.
+    scheduler.estimate_cached_prefix_tokens.assert_called_once_with(token_ids)
+    assert scheduler.estimate_cached_prefix_tokens.call_args.args[0] is token_ids
+
+    # Both consumers received cached_tokens=8.
+    assert scheduler.preflight_eviction_request.call_args.kwargs.get(
+        "cached_tokens", 0
+    ) == 8
+    assert scheduler.preflight_or_raise.call_args.kwargs.get("cached_tokens", 0) == 8
+
+    # The read-only estimate must not touch the allocating fetch_cache path.
+    scheduler.block_aware_cache.fetch_cache.assert_not_called()
+
+    # Fail-closed: a raising probe must produce cached_tokens=0.
+    scheduler.estimate_cached_prefix_tokens = MagicMock(side_effect=RuntimeError)
+    scheduler.preflight_eviction_request = MagicMock(return_value=None)
+    scheduler.preflight_or_raise = MagicMock()
+
+    await engine.preflight_chat(
+        messages=[{"role": "user", "content": "x"}],
+        request_id="req-fail-closed",
+    )
+    assert scheduler.preflight_eviction_request.call_args.kwargs.get(
+        "cached_tokens", 0
+    ) == 0
+    assert scheduler.preflight_or_raise.call_args.kwargs.get("cached_tokens", 0) == 0
 
 
 @pytest.mark.asyncio

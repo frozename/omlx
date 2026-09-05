@@ -86,6 +86,7 @@ class BatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        cached_tokens: int = 0,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -98,6 +99,7 @@ class BatchedEngine(BaseEngine):
                 None,
             ),
             text_only=True,
+            cached_tokens=cached_tokens,
         )
 
     @property
@@ -1184,7 +1186,8 @@ class BatchedEngine(BaseEngine):
         # through the existing handler chain so the response shape stays
         # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            token_ids = self._tokenizer.encode(prompt)
+            num_tokens = len(token_ids)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -1197,8 +1200,23 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
+        cached = 0
+        fn = getattr(scheduler, "estimate_cached_prefix_tokens", None)
+        if fn is not None:
+            try:
+                cached = int(fn(token_ids))
+            except Exception:
+                logger.debug(
+                    "BatchedEngine.preflight_chat: cached-prefix estimate "
+                    "failed; pricing cold",
+                    exc_info=True,
+                )
+                cached = 0
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            cached_tokens=cached,
         )
 
     async def preflight_completion(

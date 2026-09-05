@@ -778,6 +778,85 @@ def test_admission_estimate_is_the_single_formula():
     assert est.estimated == est.kv_exact + est.transient
 
 
+def test_route_admission_prices_cached_prefix_as_resident_kv():
+    """Route-time preflight must charge the cached prefix as resident-to-be
+    KV, not as already-resident.
+
+    At HTTP route time the stored prefix has not been materialized yet, so
+    ``cached_kv_resident=False`` makes ``_admission_estimate`` price the
+    full prompt's KV (``num_prompt_tokens``) via
+    ``estimate_resident_kv_bytes``.  The in-stream re-check keeps the
+    default ``True`` and charges only ``new_tokens`` because
+    ``_prepare_prefix_cache_for_request`` has already loaded the hit.
+
+    The ordering invariant is ``e_resident < e_route < e_cold``: an
+    over-credit can only cost latency (the in-stream re-check pauses),
+    never memory, because the credited KV is priced as resident-to-be.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+
+    real_fn = scheduler.memory_monitor.estimate_resident_kv_bytes
+    spy = MagicMock(wraps=real_fn)
+    scheduler.memory_monitor.estimate_resident_kv_bytes = spy
+
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        e_route = scheduler._admission_estimate(
+            num_prompt_tokens=100,
+            cached_tokens=96,
+            current=0,
+            cached_kv_resident=False,
+        )
+        route_call_tokens = spy.call_args.args[0]
+
+        spy.reset_mock()
+        e_resident = scheduler._admission_estimate(
+            num_prompt_tokens=100,
+            cached_tokens=96,
+            current=0,
+        )
+        resident_call_tokens = spy.call_args.args[0]
+
+        spy.reset_mock()
+        e_cold = scheduler._admission_estimate(
+            num_prompt_tokens=100,
+            cached_tokens=0,
+            current=0,
+        )
+        cold_call_tokens = spy.call_args.args[0]
+
+    assert e_route is not None
+    assert e_resident is not None
+    assert e_cold is not None
+
+    # Route-time charges the full prompt; in-stream charges only new tokens.
+    assert route_call_tokens == 100
+    assert resident_call_tokens == 4
+    assert cold_call_tokens == 100
+
+    # Over-credit is safe: e_route prices the credited KV as resident-to-be,
+    # so it can only be tighter than the cold prefill, never looser than the
+    # in-stream check.
+    assert e_resident.estimated < e_route.estimated < e_cold.estimated
+
+    # The route-time path through preflight_or_raise must also charge the
+    # full prompt (num_prompt_tokens) not just new_tokens, so the cached
+    # prefix is priced as resident-to-be KV at HTTP time.
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        spy.reset_mock()
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=100, cached_tokens=96, request_id="req-route"
+        )
+        assert spy.call_args.args[0] == 100
+
+
 def test_admission_charges_full_step_under_speed_priority():
     """Speed priority prices the full prefill_step_size chunk instead of the
     throttle floor, so admission only accepts what completes at full speed."""

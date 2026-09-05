@@ -832,9 +832,12 @@ class MemoryMonitor:
         full_kv_len = new_tokens + max(cached_tokens, 0)
         attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
-        # KV growth attributable to this request: only the new tokens.
-        # The cached portion is already counted in the caller's current-usage
-        # baseline. Resident math includes window-capped sliding-window
+        # KV growth attributable to this request: only the new tokens when
+        # the cached prefix is already resident (in-stream re-check after
+        # _prepare_prefix_cache_for_request materialized the hit). Route-time
+        # preflight instead charges the full prompt via _admission_estimate's
+        # cached_kv_resident=False path, because the stored blocks have not
+        # been loaded yet. Resident math includes window-capped sliding-window
         # layers and measured fixed state, not just full-attention KVCache.
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
         return attn + kv + self._ane_prefill_transient_bytes
