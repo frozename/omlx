@@ -158,6 +158,22 @@ class BoundarySnapshotDiagnostics:
                     last_event[key] = value
             self._last_event = last_event
 
+    def last_cause(self, request_id: str | None) -> str | None:
+        """Reason of the last override_miss recorded for ``request_id``.
+
+        Uses the same predicate record() applies when attaching a cause to
+        store_skip events.  Callers must read this before the store_skip
+        record() call, which overwrites ``_last_event``.
+        """
+        with self._lock:
+            if (
+                self._last_event is not None
+                and self._last_event.get("event") == "override_miss"
+                and self._last_event.get("request_id") == request_id
+            ):
+                return self._last_event.get("reason")
+            return None
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {

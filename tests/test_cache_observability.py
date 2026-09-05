@@ -303,6 +303,18 @@ def test_boundary_snapshot_diagnostics_preserve_store_skip_cause():
     assert diagnostics.snapshot()["last_event"]["cause"] == "ssd_load_failed"
 
 
+def test_boundary_snapshot_diagnostics_expose_last_cause():
+    diagnostics = BoundarySnapshotDiagnostics()
+    diagnostics.record(
+        "override_miss",
+        reason="no_aligned_snapshots",
+        request_id="req",
+    )
+
+    assert diagnostics.last_cause("req") == "no_aligned_snapshots"
+    assert diagnostics.last_cause("other") is None
+
+
 def test_boundary_snapshot_diagnostics_clear_resets_state():
     diagnostics = BoundarySnapshotDiagnostics()
     diagnostics.record(

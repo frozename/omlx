@@ -11820,24 +11820,50 @@ class Scheduler:
                             available_boundaries = len(
                                 self._boundary_cache_snapshots.get(request_id, {})
                             )
+                            # Read the miss cause BEFORE the store_skip record:
+                            # record() overwrites _last_event, so reading after
+                            # it would return None.
+                            cause = self._boundary_snapshot_diagnostics.last_cause(
+                                request_id
+                            )
+                            block = self.config.paged_cache_block_size
+                            stored_prefix = (
+                                (len(cacheable_sequence) // block) * block
+                                if block > 0
+                                else 0
+                            )
+                            if cause == "no_aligned_snapshots" and stored_prefix <= (
+                                request.cached_tokens or 0
+                            ):
+                                # The aligned prefix is already in the cache;
+                                # the skip is a no-op, not a broken reuse.
+                                skip_reason = "prefix_already_stored"
+                                skip_log = logger.debug
+                            else:
+                                skip_reason = "boundary_snapshot_unavailable"
+                                skip_log = logger.info
                             self._boundary_snapshot_diagnostics.record(
                                 "store_skip",
-                                reason="boundary_snapshot_unavailable",
+                                reason=skip_reason,
                                 request_id=request_id,
                                 token_count=len(cacheable_sequence),
-                                block_size=self.config.paged_cache_block_size,
+                                block_size=block,
                                 available_boundaries=available_boundaries,
                             )
-                            logger.info(
+                            skip_log(
                                 "Skipping cache store for %s: reason=%s "
-                                "tokens=%d block_size=%d available_boundaries=%d; "
+                                "tokens=%d block_size=%d available_boundaries=%d "
+                                "cause=%s stored_prefix=%d cached_tokens=%d; "
                                 "storing live non-sliceable state would corrupt "
                                 "later prefix hits",
                                 request_id,
-                                "boundary_snapshot_unavailable",
+                                skip_reason,
                                 len(cacheable_sequence),
-                                self.config.paged_cache_block_size,
+                                block,
                                 available_boundaries,
+                                cause,
+                                stored_prefix,
+                                request.cached_tokens or 0,
                             )
                             block_table = None
                             if self.paged_cache_manager:

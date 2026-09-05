@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import logging
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -3124,6 +3125,59 @@ class TestSchedulerBoundarySnapshots:
         }
         assert diagnostics["last_event"]["cause"] == "no_snapshots"
         assert "reason=boundary_snapshot_unavailable" in caplog.text
+
+    def test_cleanup_finished_skip_labels_hit_continuation_as_prefix_already_stored(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        """A prefix-cache hit that continues past the prompt leaves only a
+        decode-time boundary snapshot beyond the prompt range. The skip is
+        benign — the aligned prefix is already stored — so the log line must
+        name prefix_already_stored at DEBUG with the underlying cause, not
+        boundary_snapshot_unavailable at INFO."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._boundary_snapshot_required = True
+
+        request = Request(
+            request_id="req",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        request.needs_think_prefix = True
+        request.cached_tokens = 4
+        request.output_token_ids = [6, 7, 8]
+        request._extracted_cache = [{"state": "live-cache"}]
+        request._model_cache_config = "live-config"
+
+        scheduler.running["req"] = request
+        scheduler.requests["req"] = request
+        # A decode capture beyond the prompt: no boundary inside it.
+        scheduler._boundary_cache_snapshots["req"] = {8: None}
+
+        with caplog.at_level("DEBUG", logger="omlx.scheduler"):
+            scheduler._cleanup_finished({"req"})
+
+        rec = next(
+            r
+            for r in caplog.records
+            if "reason=prefix_already_stored" in r.getMessage()
+        )
+        assert rec.levelno == logging.DEBUG
+        assert "cause=no_aligned_snapshots" in rec.getMessage()
+        assert "stored_prefix=4" in rec.getMessage()
+        diagnostics = scheduler._boundary_snapshot_diagnostics.snapshot()
+        assert diagnostics["reasons"] == {
+            "no_aligned_snapshots": 1,
+            "prefix_already_stored": 1,
+        }
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        scheduler.block_aware_cache.clear_request_entry.assert_called_once_with(
+            "req"
+        )
 
     def test_prefix_lookup_observation_explains_reprefill_boundary(
         self, mock_model, mock_tokenizer
