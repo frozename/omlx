@@ -1004,3 +1004,50 @@ class TestPagedCacheManager:
         assert manager.cached_block_hash_to_block.get_block(hash3) is None
         assert manager.stats.hits == hits_before
         assert manager.stats.misses == misses_before
+
+    def test_peek_cached_prefix_split_distinguishes_resident_and_ssd_only(self):
+        """peek_cached_prefix_split reports resident and SSD-only tokens
+        separately rather than collapsing them to a single total.
+
+        A memory-resident block and an SSD-only block both count as
+        ``stored`` in ``peek_cached_prefix_tokens``, but they cost
+        differently at admission time: resident blocks are already in
+        ``current``, SSD-only blocks must be loaded into newly allocated
+        memory.  The split lets route-time admission charge only the
+        non-resident part.
+        """
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+
+        # Two chained blocks covering tokens [1..8] in memory.
+        hash1 = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        hash2 = compute_block_hash(hash1, [5, 6, 7, 8], model_name="test-model")
+        for block_hash in (hash1, hash2):
+            block = manager.allocate_block()
+            block.block_hash = block_hash
+            block.token_count = 4
+            manager.cached_block_hash_to_block.insert(block_hash, block)
+
+        # A third chained block on SSD only.
+        hash3 = compute_block_hash(hash2, [9, 10, 11, 12], model_name="test-model")
+        mock_ssd = MagicMock(spec=[])
+        mock_ssd.has_block = MagicMock(side_effect=lambda h: h == hash3)
+        manager._paged_ssd_cache_manager = mock_ssd
+
+        prompt = list(range(1, 13))  # 12 tokens = 3 full blocks
+        resident, ssd_only = manager.peek_cached_prefix_split(prompt)
+        assert resident == 8   # two memory-resident blocks
+        assert ssd_only == 4   # one SSD-only block
+
+        # Total matches peek_cached_prefix_tokens.
+        assert manager.peek_cached_prefix_tokens(prompt) == 12
+
+        # A fourth block in neither tier stops the walk.
+        prompt4 = list(range(1, 17))  # 16 tokens = 4 full blocks
+        resident4, ssd_only4 = manager.peek_cached_prefix_split(prompt4)
+        assert resident4 == 8
+        assert ssd_only4 == 4
+
+        # Purity: no allocation, no stats movement.
+        assert manager.cached_block_hash_to_block.get_block(hash3) is None

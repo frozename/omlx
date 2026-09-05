@@ -8565,6 +8565,55 @@ class Scheduler:
         )
         return True
 
+    def estimate_cached_prefix_split(
+        self, token_ids: list[int]
+    ) -> tuple[int, int]:
+        """Estimate leading prompt tokens already cached, split by tier.
+
+        Read-only companion to ``estimate_cached_prefix_tokens`` that
+        distinguishes **memory-resident** blocks (already in the paged
+        cache, counted in ``_current_usage_bytes``) from **SSD-only**
+        blocks (present on SSD but not in memory, must be loaded into
+        newly allocated memory).
+
+        The stateful exact-hit rule does **not** apply to the split here.
+        The rule clamps the *total* reusable credit because a stateful
+        full-cache hit cannot start generation at N and must re-prefill.
+        That clamp affects how much prefill *work* remains (``new_tokens``
+        in ``_admission_estimate``), not how much KV is already allocated.
+        Resident blocks are in ``current`` regardless of whether the
+        stateful rule says they need re-prefill; SSD-only blocks still
+        need loading regardless.  The clamp is applied by
+        ``estimate_cached_prefix_tokens`` to the total, and the resident
+        count returned here feeds ``charge_kv_tokens`` in
+        ``_admission_estimate`` so route-time admission does not
+        double-count resident KV that is already in ``current``.
+
+        ``_boundary_snapshot_required`` is never resolved lazily here,
+        for the same reason as ``estimate_cached_prefix_tokens``:
+        ``_detect_boundary_snapshot_need`` runs ``model.make_cache()`` and
+        mutates the model, which a route-time estimate must not do.
+
+        Args:
+            token_ids: Prompt token ids being admitted
+
+        Returns:
+            ``(resident_tokens, ssd_only_tokens)``, or ``(0, 0)`` when
+            there is no prefix cache or the lookup raises.
+        """
+        if self.block_aware_cache is None:
+            return 0, 0
+
+        try:
+            return self.block_aware_cache.peek_cached_prefix_split(token_ids)
+        except Exception:
+            logger.debug(
+                "Cached-prefix split estimate failed for %d prompt tokens",
+                len(token_ids or []),
+                exc_info=True,
+            )
+            return 0, 0
+
     def estimate_cached_prefix_tokens(self, token_ids: list[int]) -> int:
         """Estimate how many leading prompt tokens are already cached.
 
@@ -8596,7 +8645,10 @@ class Scheduler:
             return 0
 
         try:
-            cached = int(self.block_aware_cache.peek_cached_prefix_tokens(token_ids))
+            resident, ssd_only = (
+                self.block_aware_cache.peek_cached_prefix_split(token_ids)
+            )
+            cached = resident + ssd_only
             stateful = self._boundary_snapshot_required is not False
 
             if cached >= len(token_ids) and stateful:
@@ -10178,6 +10230,7 @@ class Scheduler:
         current: int,
         text_only: bool = False,
         cached_kv_resident: bool = True,
+        resident_kv_tokens: int = 0,
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
 
@@ -10204,6 +10257,17 @@ class Scheduler:
         admits what completes at full-speed chunks, matching the regime
         the prefill will actually run in.
 
+        ``resident_kv_tokens`` credits KV blocks that are already
+        memory-resident at route time.  Those blocks are already counted
+        in ``current`` (via ``_current_usage_bytes``), so charging them
+        again in ``kv_exact`` would double-count.  At route time
+        (``cached_kv_resident=False``) the KV charge is
+        ``max(num_prompt_tokens - resident_kv_tokens, 0)``: SSD-only and
+        uncached tokens are still charged, resident tokens are not.  The
+        in-stream re-check (``cached_kv_resident=True``) ignores this
+        parameter and charges ``new_tokens`` because
+        ``_prepare_prefix_cache_for_request`` has already loaded the hit.
+
         Returns None when nothing can be estimated (no model info and no
         measurements yet); callers skip the check, as before.
         """
@@ -10211,23 +10275,35 @@ class Scheduler:
         if monitor is None:
             return None
         # --- credit-driven fail-open seam --------------------------------
-        # A credit (cached_tokens) must NEVER cause this guard to skip
-        # itself. Returning None here is reserved for the genuinely
-        # uninformative case (no monitor above, or no model info / zero
-        # estimate below) — a credit is a *claim* about the prompt, not
-        # missing data, and the route-time peek that supplies it
-        # (estimate_cached_prefix_tokens, :8568) can OVER-REPORT: it peeks
-        # with no extra_keys, so a prompt whose text matches a cached entry
-        # but whose images differ is reported as a hit, and LRU can drop the
-        # prefix between the peek and schedule. When the credit over-reports
-        # to >= the prompt length, new_tokens computes to 0 (or 1, which
-        # makes prefill_tokens 0) and the old early returns skipped the
-        # guard entirely — admitting the FULL prefill unchecked. Floor
+        # A credit (cached_tokens / resident_kv_tokens) must NEVER cause
+        # this guard to skip itself. Returning None here is reserved for
+        # the genuinely uninformative case (no monitor above, or no model
+        # info / zero estimate below) — a credit is a *claim* about the
+        # prompt, not missing data, and the route-time peek that supplies
+        # it (estimate_cached_prefix_tokens / estimate_cached_prefix_split,
+        # :8568) can OVER-REPORT: it peeks with no extra_keys, so a prompt
+        # whose text matches a cached entry but whose images differ is
+        # reported as a hit, and LRU can drop the prefix between the peek
+        # and schedule. When the credit over-reports to >= the prompt
+        # length, new_tokens computes to 0 (or 1, which makes
+        # prefill_tokens 0) and the old early returns skipped the guard
+        # entirely — admitting the FULL prefill unchecked. Floor
         # new_tokens to 1 so an exact/near-exact hit still prices its
-        # residency and is CHECKED, not admitted by skipping. A true
-        # full-cache hit then prices a 1-token prefill, which passes the
-        # check under normal memory but is rejected when memory is
-        # genuinely exhausted — admitted by passing, not by skipping.
+        # residency and is CHECKED, not admitted by skipping.
+        #
+        # Route-time path (cached_kv_resident=False): charges
+        # max(num_prompt_tokens - resident_kv_tokens, 0) for KV — resident
+        # blocks are already in ``current``, so only SSD-only and uncached
+        # tokens need allocation.  A true full-cache hit with all blocks
+        # resident charges ~0 KV but still prices the transient for a
+        # 1-token floored prefill, which passes under normal memory but
+        # is rejected when memory is genuinely exhausted — admitted by
+        # passing, not by skipping.
+        #
+        # In-stream path (cached_kv_resident=True): charges new_tokens
+        # because _prepare_prefix_cache_for_request has already loaded the
+        # cached prefix into the request's block table.  resident_kv_tokens
+        # is ignored.
         new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
         if new_tokens < 1:
             new_tokens = 1
@@ -10249,14 +10325,17 @@ class Scheduler:
         prefill_tokens = max(new_tokens - 1, 1)
         floor_chunk = min(charge_tokens, prefill_tokens)
         kv_len = max(int(num_prompt_tokens) - 1 - floor_chunk, 0)
-        # Route-time preflight charges the cached prefix as resident-to-be
-        # KV (num_prompt_tokens) because the stored blocks have not been
-        # materialized yet; the in-stream re-check keeps the default and
+        # Route-time preflight credits KV blocks already resident in the
+        # paged cache (they are counted in ``current``); only SSD-only and
+        # uncached tokens need new allocation.  The in-stream re-check
         # charges only new_tokens since _prepare_prefix_cache_for_request
         # has already loaded the hit.
-        charge_kv_tokens = (
-            num_prompt_tokens if not cached_kv_resident else new_tokens
-        )
+        if cached_kv_resident:
+            charge_kv_tokens = new_tokens
+        else:
+            charge_kv_tokens = max(
+                int(num_prompt_tokens) - max(int(resident_kv_tokens), 0), 0
+            )
         kv_exact = int(
             monitor.estimate_resident_kv_bytes(
                 charge_kv_tokens, chunk_tokens=floor_chunk
@@ -10327,6 +10406,7 @@ class Scheduler:
         cached_tokens: int = 0,
         request_id: str | None = None,
         text_only: bool = False,
+        resident_kv_tokens: int = 0,
     ) -> None:
         """Pre-StreamingResponse prefill memory check.
 
@@ -10339,6 +10419,12 @@ class Scheduler:
         directly (no Request object) and raises instead of returning a
         message — the in-stream re-check inside ``_schedule_waiting``
         remains as defense-in-depth.
+
+        ``resident_kv_tokens`` credits KV blocks already memory-resident at
+        route time (from ``estimate_cached_prefix_split``).  Those blocks
+        are in ``current`` and must not be double-charged.  Defaults to 0
+        when the caller does not supply the split — the engine wiring is a
+        separate follow-up.
         """
         if not self._prefill_memory_guard:
             return
@@ -10354,6 +10440,7 @@ class Scheduler:
             current=current,
             text_only=text_only,
             cached_kv_resident=False,
+            resident_kv_tokens=resident_kv_tokens,
         )
         if est is None:
             return
@@ -10415,6 +10502,7 @@ class Scheduler:
         cached_tokens: int = 0,
         request_id: str | None = None,
         text_only: bool = False,
+        resident_kv_tokens: int = 0,
     ) -> PrefillEvictionRequest | None:
         """Return an idle-model eviction request for route-level preflight.
 
@@ -10423,6 +10511,9 @@ class Scheduler:
         The API-facing engines call this first, run the async pool callback if
         needed, then call ``preflight_or_raise`` to re-measure and reject only
         if eviction did not create enough headroom.
+
+        ``resident_kv_tokens`` credits KV blocks already memory-resident at
+        route time; see ``preflight_or_raise`` for the rationale.
         """
         if not self._prefill_memory_guard:
             return None
@@ -10440,6 +10531,7 @@ class Scheduler:
             current=current,
             text_only=text_only,
             cached_kv_resident=False,
+            resident_kv_tokens=resident_kv_tokens,
         )
         if est is None:
             return None

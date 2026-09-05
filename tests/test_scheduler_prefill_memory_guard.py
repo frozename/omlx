@@ -218,6 +218,10 @@ def test_preflight_admits_fully_cached_request_by_passing_check():
     returns None (admitted). This replaces the old fail-open behaviour
     where the guard returned None unconditionally for a full cache hit
     regardless of the limit.
+
+    ``None`` from ``_preflight_memory_check`` means "admitted" both when
+    the guard PASSED and when it was SKIPPED, so this test also asserts
+    the estimate is actually computed (not None) to distinguish the two.
     """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
@@ -228,6 +232,15 @@ def test_preflight_admits_fully_cached_request_by_passing_check():
         patch("omlx.scheduler.mx.get_active_memory", return_value=0),
         patch("omlx.scheduler.get_phys_footprint", return_value=0),
     ):
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=1000,
+            cached_tokens=1000,
+            current=0,
+        )
+        assert est is not None, (
+            "estimate must be computed (not skipped) for a full-cache hit"
+        )
+        assert est.estimated > 0
         assert scheduler._preflight_memory_check(req) is None
 
 
@@ -331,7 +344,8 @@ def test_admission_estimate_absurd_over_credit_returns_real_estimate():
 
 def test_admission_estimate_returns_none_when_monitor_is_none():
     """The genuinely-uninformative case: memory_monitor is None must still
-    return None. This is the only legitimate None path.
+    return None. This is one of two legitimate None paths; the other is
+    when ``kv_exact <= 0 and transient <= 0`` (missing model dims).
     """
     scheduler = _make_scheduler()
     scheduler.memory_monitor = None
@@ -1358,7 +1372,12 @@ def _peek_scheduler(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SchedulerConfig(paged_cache_block_size=4)
     scheduler.block_aware_cache = (
-        MagicMock(peek_cached_prefix_tokens=MagicMock(return_value=cached))
+        MagicMock(
+            peek_cached_prefix_tokens=MagicMock(return_value=cached),
+            peek_cached_prefix_split=MagicMock(
+                return_value=(0, cached)
+            ),
+        )
         if with_cache
         else None
     )
@@ -1416,3 +1435,372 @@ def test_estimate_cached_prefix_applies_stateful_exact_hit_rule():
     uncached = _peek_scheduler(required=True, with_cache=False)
     assert uncached.estimate_cached_prefix_tokens(exact) == 0
     assert not uncached._detect_boundary_snapshot_need.called
+
+
+# ---------------------------------------------------------------------------
+# Resident-KV credit at route time (this commit)
+# ---------------------------------------------------------------------------
+
+
+def _peek_split_scheduler(
+    *,
+    resident: int = 0,
+    ssd_only: int = 0,
+    with_cache: bool = True,
+) -> Scheduler:
+    """Scheduler slice holding only what estimate_cached_prefix_split reads."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_aware_cache = (
+        MagicMock(
+            peek_cached_prefix_split=MagicMock(
+                return_value=(resident, ssd_only)
+            ),
+            peek_cached_prefix_tokens=MagicMock(
+                return_value=resident + ssd_only
+            ),
+        )
+        if with_cache
+        else None
+    )
+    return scheduler
+
+
+def test_estimate_cached_prefix_split_returns_raw_split():
+    """estimate_cached_prefix_split returns (resident, ssd_only) without
+    applying the stateful exact-hit clamp.  The clamp applies to the total
+    in estimate_cached_prefix_tokens, not to the split: resident blocks
+    are in ``current`` regardless of whether the stateful rule says they
+    need re-prefill, and SSD-only blocks still need loading regardless.
+    """
+    scheduler = _peek_split_scheduler(resident=8, ssd_only=4)
+    scheduler._boundary_snapshot_required = True
+    scheduler._gdn_split_active = MagicMock(return_value=False)
+    scheduler._detect_boundary_snapshot_need = MagicMock(return_value=True)
+
+    # Split is raw — no clamp.
+    assert scheduler.estimate_cached_prefix_split(list(range(12))) == (8, 4)
+
+    # Total is clamped: cached=12 >= len=12, stateful, no split -> 0.
+    assert scheduler.estimate_cached_prefix_tokens(list(range(12))) == 0
+
+
+def test_estimate_cached_prefix_split_fail_closed_on_exception():
+    """Any exception in the peek must yield (0, 0), mirroring the
+    fail-closed contract of estimate_cached_prefix_tokens.
+    """
+    scheduler = Scheduler.__new__(Scheduler)
+    cache = MagicMock()
+    cache.peek_cached_prefix_split = MagicMock(side_effect=RuntimeError)
+    scheduler.block_aware_cache = cache
+    assert scheduler.estimate_cached_prefix_split(list(range(8))) == (0, 0)
+
+
+def test_estimate_cached_prefix_split_returns_zeros_without_cache():
+    """No prefix cache -> (0, 0), same as estimate_cached_prefix_tokens."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_aware_cache = None
+    assert scheduler.estimate_cached_prefix_split(list(range(8))) == (0, 0)
+
+
+def test_route_admission_credits_resident_kv_and_admits_under_tight_limit():
+    """Headline behaviour: a prompt whose prefix is fully memory-resident
+    is charged ~0 incremental KV at route time and is ADMITTED under a
+    limit that the full-prompt (cold) charge would have failed.
+
+    Resident blocks are already counted in ``current``, so charging them
+    again in ``kv_exact`` double-counts.  At route time
+    (``cached_kv_resident=False``) the KV charge is
+    ``num_prompt_tokens - resident_kv_tokens``; with all blocks resident
+    that is 0, leaving only the transient.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+
+    num_prompt = 10_000
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+
+    with patches[0], patches[1]:
+        cold_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=0,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=0,
+        )
+    assert cold_est is not None
+    assert cold_est.kv_exact > 0
+
+    with patches[0], patches[1]:
+        resident_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=num_prompt,
+        )
+    assert resident_est is not None
+    assert resident_est.kv_exact == 0, (
+        "fully-resident prefix must charge 0 incremental KV"
+    )
+    assert resident_est.estimated < cold_est.estimated
+
+    # Tight limit: resident fits, cold does not.
+    tight_limit = int(resident_est.estimated) + 1
+    assert tight_limit < cold_est.estimated
+    scheduler._memory_hard_limit_bytes = tight_limit
+
+    # Resident: admitted (no raise).
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            resident_kv_tokens=num_prompt,
+            request_id="req-resident",
+        )
+
+    # Cold: rejected.
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=0,
+            resident_kv_tokens=0,
+            request_id="req-cold",
+        )
+
+
+def test_route_admission_charges_ssd_only_kv_and_rejects_under_tight_limit():
+    """SSD-only blocks are NOT resident: they must be loaded into newly
+    allocated memory, so they are still charged at route time.  Under the
+    same tight limit that admits a fully-resident prompt, an SSD-only
+    prompt of the same size is REJECTED.  Resident and SSD-only must be
+    demonstrably different.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+
+    num_prompt = 10_000
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+
+    with patches[0], patches[1]:
+        resident_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=num_prompt,
+        )
+    assert resident_est is not None
+    assert resident_est.kv_exact == 0
+
+    with patches[0], patches[1]:
+        ssd_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,  # SSD blocks count as cached
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=0,  # but none are resident
+        )
+    assert ssd_est is not None
+    assert ssd_est.kv_exact > 0, (
+        "SSD-only prefix must charge full KV (not resident)"
+    )
+    assert ssd_est.estimated > resident_est.estimated
+
+    # Tight limit: resident fits, SSD-only does not.
+    tight_limit = int(resident_est.estimated) + 1
+    assert tight_limit < ssd_est.estimated
+    scheduler._memory_hard_limit_bytes = tight_limit
+
+    # Resident: admitted.
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            resident_kv_tokens=num_prompt,
+            request_id="req-resident",
+        )
+
+    # SSD-only: rejected.
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            resident_kv_tokens=0,
+            request_id="req-ssd-only",
+        )
+
+
+def test_route_admission_mixed_prefix_charges_only_non_resident():
+    """A mixed prefix (some resident, some SSD-only) charges only the
+    non-resident part.  The KV charge is ``num_prompt_tokens -
+    resident_kv_tokens``, which includes SSD-only and uncached tokens but
+    not resident tokens.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+
+    num_prompt = 10_000
+    resident = 6_000
+    ssd_only = 3_000
+    cached_total = resident + ssd_only  # 9_000 cached, 1_000 new
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+
+    with patches[0], patches[1]:
+        mixed_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=cached_total,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=resident,
+        )
+    assert mixed_est is not None
+
+    # charge_kv_tokens = num_prompt - resident = 4000
+    # (3000 SSD-only + 1000 new)
+    with patches[0], patches[1]:
+        spy = MagicMock(
+            wraps=scheduler.memory_monitor.estimate_resident_kv_bytes
+        )
+        scheduler.memory_monitor.estimate_resident_kv_bytes = spy
+        scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=cached_total,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=resident,
+        )
+        charge_kv = spy.call_args.args[0]
+
+    assert charge_kv == num_prompt - resident  # 4000
+
+    # Compare against fully-resident and fully-cold estimates.
+    with patches[0], patches[1]:
+        full_resident_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=num_prompt,
+        )
+    with patches[0], patches[1]:
+        cold_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=0,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=0,
+        )
+
+    assert full_resident_est.kv_exact == 0
+    assert cold_est.kv_exact > mixed_est.kv_exact > 0
+    assert (
+        full_resident_est.estimated
+        < mixed_est.estimated
+        < cold_est.estimated
+    )
+
+
+def test_route_admission_resident_credit_through_preflight_or_raise():
+    """Drive the resident credit through ``preflight_or_raise`` (the
+    route-time caller), not only via ``_admission_estimate`` directly.
+    A prior agent shipped a mutation that did not bite precisely because
+    its test called ``_admission_estimate`` directly and never exercised
+    the caller's kwarg.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+
+    num_prompt = 10_000
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+
+    # Find the tight limit from the estimates.
+    with patches[0], patches[1]:
+        resident_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=num_prompt,
+        )
+    with patches[0], patches[1]:
+        cold_est = scheduler._admission_estimate(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=0,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=0,
+        )
+    assert resident_est.kv_exact == 0
+    assert cold_est.kv_exact > 0
+
+    tight_limit = int(resident_est.estimated) + 1
+    scheduler._memory_hard_limit_bytes = tight_limit
+
+    # Through preflight_or_raise: resident admitted, cold rejected.
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=num_prompt,
+            resident_kv_tokens=num_prompt,
+            request_id="req-resident-route",
+        )
+
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt,
+            cached_tokens=0,
+            resident_kv_tokens=0,
+            request_id="req-cold-route",
+        )
+
+
+def test_in_stream_path_ignores_resident_kv_tokens():
+    """The in-stream path (cached_kv_resident=True) must NOT change
+    behaviour when resident_kv_tokens is passed: it charges new_tokens
+    because _prepare_prefix_cache_for_request has already loaded the hit.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+
+    with patches[0], patches[1]:
+        est_default = scheduler._admission_estimate(
+            num_prompt_tokens=1000,
+            cached_tokens=900,
+            current=0,
+        )
+    with patches[0], patches[1]:
+        est_with_resident = scheduler._admission_estimate(
+            num_prompt_tokens=1000,
+            cached_tokens=900,
+            current=0,
+            resident_kv_tokens=900,
+        )
+
+    assert est_default is not None
+    assert est_with_resident is not None
+    # In-stream path: resident_kv_tokens is ignored, both charge new_tokens.
+    assert est_default.kv_exact == est_with_resident.kv_exact
+    assert est_default.estimated == est_with_resident.estimated

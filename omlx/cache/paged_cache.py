@@ -1084,6 +1084,85 @@ class PagedCacheManager(CacheManager):
 
             return cached_blocks, num_cached_tokens
 
+    def peek_cached_prefix_split(
+        self,
+        token_ids: List[int],
+        *,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+    ) -> Tuple[int, int]:
+        """
+        Count leading full blocks of ``token_ids`` split by storage tier.
+
+        Read-only admission probe — same purity contract as
+        ``peek_cached_prefix_tokens`` (no allocation, no references, no
+        lazy SSD registration, no hit/miss stats).  Distinguishes blocks
+        that are **memory-resident** (already in the paged cache hash map)
+        from blocks that are **SSD-only** (present on SSD but not in
+        memory).  The two tiers cost differently at admission time:
+
+        - memory-resident blocks are already counted in
+          ``Scheduler._current_usage_bytes``, so their incremental KV
+          allocation is ~0;
+        - SSD-only blocks must be loaded into newly allocated memory, so
+          they cost like new tokens.
+
+        The walk stops at the first block that is in **neither** tier,
+        preserving the existing prefix-contiguity semantics.
+
+        Args:
+            token_ids: Token IDs to look up
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
+            extra_key_token_start: First token ``extra_keys`` applies to
+            extra_key_ranges: Segmented extra keys (VLM), sorted by start
+
+        Returns:
+            ``(resident_tokens, ssd_only_tokens)`` — leading tokens covered
+            by memory-resident full blocks and by SSD-only full blocks
+            respectively.
+        """
+        if not self.enable_caching or not token_ids:
+            return 0, 0
+
+        with self._lock:
+            parent_hash = None
+            resident_tokens = 0
+            ssd_only_tokens = 0
+            ssd_manager = self._paged_ssd_cache_manager
+
+            num_full_blocks = len(token_ids) // self.block_size
+
+            for i in range(num_full_blocks):
+                start = i * self.block_size
+                end = start + self.block_size
+                block_tokens = token_ids[start:end]
+                block_extra_keys = resolve_block_extra_keys(
+                    end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
+
+                block_hash = compute_block_hash(
+                    parent_hash, block_tokens,
+                    extra_keys=block_extra_keys, model_name=self.model_name,
+                )
+
+                in_memory = (
+                    self.cached_block_hash_to_block.get_block(block_hash) is not None
+                )
+                if in_memory:
+                    resident_tokens += self.block_size
+                elif ssd_manager is not None and ssd_manager.has_block(block_hash):
+                    ssd_only_tokens += self.block_size
+                else:
+                    break
+
+                parent_hash = block_hash
+
+            return resident_tokens, ssd_only_tokens
+
     def peek_cached_prefix_tokens(
         self,
         token_ids: List[int],
@@ -1113,46 +1192,13 @@ class PagedCacheManager(CacheManager):
             Number of leading tokens covered by stored full blocks. The walk
             stops at the first block that is in neither memory nor SSD.
         """
-        if not self.enable_caching or not token_ids:
-            return 0
-
-        with self._lock:
-            parent_hash = None
-            num_cached_tokens = 0
-            ssd_manager = self._paged_ssd_cache_manager
-
-            num_full_blocks = len(token_ids) // self.block_size
-
-            for i in range(num_full_blocks):
-                start = i * self.block_size
-                end = start + self.block_size
-                block_tokens = token_ids[start:end]
-                block_extra_keys = resolve_block_extra_keys(
-                    end,
-                    extra_keys=extra_keys,
-                    extra_key_token_start=extra_key_token_start,
-                    extra_key_ranges=extra_key_ranges,
-                )
-
-                block_hash = compute_block_hash(
-                    parent_hash, block_tokens,
-                    extra_keys=block_extra_keys, model_name=self.model_name,
-                )
-
-                stored = (
-                    self.cached_block_hash_to_block.get_block(block_hash) is not None
-                )
-                if not stored and ssd_manager is not None:
-                    # Presence on SSD counts as cached for admission even
-                    # though restoring it later costs a cold registration.
-                    stored = bool(ssd_manager.has_block(block_hash))
-                if not stored:
-                    break
-
-                parent_hash = block_hash
-                num_cached_tokens += self.block_size
-
-            return num_cached_tokens
+        resident, ssd_only = self.peek_cached_prefix_split(
+            token_ids,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        return resident + ssd_only
 
     # =========================================================================
     # Legacy hash methods (for backwards compatibility)
