@@ -1120,3 +1120,74 @@ def test_qwen4_image_request_preflight_stays_dense():
     ):
         rejection = scheduler._preflight_memory_check(request)
     assert rejection is not None
+
+
+def _peek_scheduler(
+    *,
+    required: bool | None,
+    split: bool = False,
+    cached: int = 8,
+    with_cache: bool = True,
+) -> Scheduler:
+    """Scheduler slice holding only what estimate_cached_prefix_tokens reads."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SchedulerConfig(paged_cache_block_size=4)
+    scheduler.block_aware_cache = (
+        MagicMock(peek_cached_prefix_tokens=MagicMock(return_value=cached))
+        if with_cache
+        else None
+    )
+    scheduler._boundary_snapshot_required = required
+    scheduler._gdn_split_active = MagicMock(return_value=split)
+    # Spied, never stubbed out: the real one runs make_cache() and mutates the
+    # model, which a route-time estimate must not trigger.
+    scheduler._detect_boundary_snapshot_need = MagicMock(return_value=True)
+    return scheduler
+
+
+def test_estimate_cached_prefix_applies_stateful_exact_hit_rule():
+    """The stateful exact-hit rule lives here, and only here.
+
+    A full-prompt cache hit cannot kick off generation directly: the model
+    needs state at N-1. Sliceable caches get there by trimming one token,
+    stateful ones cannot, and a split GDN sidecar can only be rewound a whole
+    block. An unresolved answer must fail closed to the stateful behaviour
+    rather than resolve itself, because resolving mutates the model.
+    """
+    exact = list(range(8))  # exactly the cached length
+    partial = list(range(9))  # one token beyond the cached prefix
+
+    def estimate(**kwargs) -> int:
+        scheduler = _peek_scheduler(**kwargs)
+        cached = scheduler.estimate_cached_prefix_tokens(exact)
+        # Asserted before the value is compared: a lazy resolve that happens
+        # to return the same boolean is invisible behaviourally, yet it still
+        # ran make_cache() and mutated the model.
+        assert not scheduler._detect_boundary_snapshot_need.called
+        return cached
+
+    # Stateful + exact hit + GDN split: re-prefill only the last block.
+    assert estimate(required=True, split=True) == 4
+
+    # Stateful + exact hit, no split: the whole prompt is recomputed.
+    assert estimate(required=True, split=False) == 0
+
+    # Unresolved fails closed to the stateful answer in both split modes.
+    assert estimate(required=None, split=True) == 4
+    assert estimate(required=None, split=False) == 0
+
+    # Resolved as sliceable: the exact hit is reusable as-is.
+    assert estimate(required=False, split=True) == 8
+    assert estimate(required=False, split=False) == 8
+
+    # A partial hit is never an exact hit, so every mode reports it unchanged.
+    for required in (True, False, None):
+        for split in (True, False):
+            scheduler = _peek_scheduler(required=required, split=split)
+            assert scheduler.estimate_cached_prefix_tokens(partial) == 8
+            assert not scheduler._detect_boundary_snapshot_need.called
+
+    # No prefix cache wired up at all.
+    uncached = _peek_scheduler(required=True, with_cache=False)
+    assert uncached.estimate_cached_prefix_tokens(exact) == 0
+    assert not uncached._detect_boundary_snapshot_need.called

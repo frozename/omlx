@@ -4641,3 +4641,45 @@ class TestReconstructionSilentFallbackHardening:
 
         assert rebuilt is not None
         assert rebuilt.offset == self.BLOCK
+
+
+def test_peek_cached_prefix_tokens_delegates_without_refs():
+    """BlockAwarePrefixCache.peek_cached_prefix_tokens stays a pure delegate.
+
+    fetch_cache builds a block table and takes references on every block it
+    returns. A route-time peek must do neither, or admission would pin blocks
+    for a request that may never be scheduled.
+    """
+    paged_cache = PagedCacheManager(
+        block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+    )
+    cache = BlockAwarePrefixCache(
+        model=MockModel(num_layers=1),
+        paged_cache_manager=paged_cache,
+    )
+
+    tokens = list(range(8))  # exactly 2 full blocks at block_size=4
+    stored = cache.store_cache("req-store", tokens, [])
+    assert stored is not None
+    assert stored.num_tokens == 8
+
+    refs_before = {
+        block_id: block.ref_count
+        for block_id, block in paged_cache.allocated_blocks.items()
+    }
+    allocated_before = len(paged_cache.allocated_blocks)
+
+    assert cache.peek_cached_prefix_tokens(tokens) == 8
+
+    assert {
+        block_id: block.ref_count
+        for block_id, block in paged_cache.allocated_blocks.items()
+    } == refs_before
+    assert len(paged_cache.allocated_blocks) == allocated_before
+
+    # The peek consumed nothing: a real fetch still finds the same two blocks.
+    table, remaining = cache.fetch_cache("req-fetch", tokens)
+    assert table is not None
+    assert table.block_ids == stored.block_ids
+    assert table.num_tokens == 8
+    assert remaining == []

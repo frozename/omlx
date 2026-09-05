@@ -950,3 +950,57 @@ class TestPagedCacheManager:
 
         assert num_tokens == 0
         assert len(cached_blocks) == 0
+
+    def test_peek_cached_prefix_tokens_is_pure(self):
+        """peek_cached_prefix_tokens is a read-only count of stored blocks.
+
+        It runs on the HTTP thread at route time, so it must not allocate a
+        block, take a reference, cold-register SSD metadata, or move the
+        hit/miss stats that the scheduler path owns.
+        """
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+
+        # Two chained blocks covering tokens [1..8].
+        hash1 = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        hash2 = compute_block_hash(hash1, [5, 6, 7, 8], model_name="test-model")
+        for block_hash in (hash1, hash2):
+            block = manager.allocate_block()
+            block.block_hash = block_hash
+            block.token_count = 4
+            manager.cached_block_hash_to_block.insert(block_hash, block)
+
+        hits_before = manager.stats.hits
+        misses_before = manager.stats.misses
+        allocated_before = len(manager.allocated_blocks)
+        refs_before = {
+            block_id: block.ref_count
+            for block_id, block in manager.allocated_blocks.items()
+        }
+
+        # 11 tokens: two stored full blocks, the trailing three are not a block.
+        prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert manager.peek_cached_prefix_tokens(prompt) == 8
+
+        assert manager.stats.hits == hits_before
+        assert manager.stats.misses == misses_before
+        assert len(manager.allocated_blocks) == allocated_before
+        assert {
+            block_id: block.ref_count
+            for block_id, block in manager.allocated_blocks.items()
+        } == refs_before
+
+        # A third chained block that lives only on SSD still counts, and
+        # counting it must not create a metadata block for it in memory.
+        hash3 = compute_block_hash(hash2, [9, 10, 11, 12], model_name="test-model")
+        mock_ssd = MagicMock(spec=[])
+        mock_ssd.has_block = MagicMock(side_effect=lambda h: h == hash3)
+        manager._paged_ssd_cache_manager = mock_ssd
+
+        assert manager.peek_cached_prefix_tokens(list(range(1, 13))) == 12
+
+        assert len(manager.allocated_blocks) == allocated_before
+        assert manager.cached_block_hash_to_block.get_block(hash3) is None
+        assert manager.stats.hits == hits_before
+        assert manager.stats.misses == misses_before

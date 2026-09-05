@@ -8565,6 +8565,55 @@ class Scheduler:
         )
         return True
 
+    def estimate_cached_prefix_tokens(self, token_ids: list[int]) -> int:
+        """Estimate how many leading prompt tokens are already cached.
+
+        Read-only companion to _prepare_prefix_cache_for_request, intended for
+        route-time admission on the HTTP thread: it peeks at stored blocks
+        without allocating, referencing or registering anything.
+
+        The stateful exact-hit rule lives here and nowhere else. A cache that
+        covers the whole prompt cannot kick off generation directly, because
+        the first decode logit needs state at N-1 rather than at N. Sliceable
+        caches get there by trimming one token; stateful non-sliceable ones
+        cannot, so the whole prompt is re-prefilled; a split GDN sidecar can
+        only be rewound by a full block.
+
+        _boundary_snapshot_required is never resolved lazily here:
+        _detect_boundary_snapshot_need runs model.make_cache() and mutates the
+        model, which a route-time estimate must not do. While the answer is
+        unresolved this fails closed to the stateful rule, which is the
+        conservative (smaller) estimate.
+
+        Args:
+            token_ids: Prompt token ids being admitted
+
+        Returns:
+            Reusable cached token count, or 0 when there is no prefix cache or
+            the lookup raises.
+        """
+        if self.block_aware_cache is None:
+            return 0
+
+        try:
+            cached = int(self.block_aware_cache.peek_cached_prefix_tokens(token_ids))
+            stateful = self._boundary_snapshot_required is not False
+
+            if cached >= len(token_ids) and stateful:
+                if self._gdn_split_active():
+                    block = int(self.config.paged_cache_block_size or 0)
+                    return max(0, cached - block)
+                return 0
+
+            return cached
+        except Exception:
+            logger.debug(
+                "Cached-prefix estimate failed for %d prompt tokens",
+                len(token_ids or []),
+                exc_info=True,
+            )
+            return 0
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return

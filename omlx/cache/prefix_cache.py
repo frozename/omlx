@@ -612,6 +612,38 @@ class BlockAwarePrefixCache(CacheManager):
 
         return model_cache_config
 
+    def peek_cached_prefix_tokens(
+        self,
+        token_ids: list[int],
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> int:
+        """
+        Count the leading full blocks of ``token_ids`` that are already stored.
+
+        Read-only companion to fetch_cache for route-time admission. It
+        creates no block table, acquires no references and moves no hit/miss
+        counters, so the HTTP thread can ask how much of a prompt is already
+        cached without pinning blocks for a request that may never run.
+
+        Args:
+            token_ids: Input token sequence
+            extra_keys: Additional keys for hash (e.g., VLM image hash)
+            extra_key_token_start: First token ``extra_keys`` applies to
+            extra_key_ranges: Segmented extra keys (VLM), sorted by start
+
+        Returns:
+            Number of leading tokens covered by stored full blocks.
+        """
+        return self.paged_cache.peek_cached_prefix_tokens(
+            token_ids,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+
     def fetch_cache(
         self,
         request_id: str,
