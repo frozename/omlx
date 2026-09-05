@@ -2924,7 +2924,7 @@ class Scheduler:
     # materialization differences. Larger blocks coarsen cache-hit granularity:
     # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
     # also leaves old SSD blocks cold until normal eviction removes them.
-    _ARRAYS_CACHE_BLOCK_SIZE = 2048
+    _ARRAYS_CACHE_BLOCK_SIZE = 256
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.
