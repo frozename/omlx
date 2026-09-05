@@ -4435,3 +4435,295 @@ def test_bracket_deep_decode_never_runs_raw_arguments():
         for call in calls or []:
             if call.function.name == "bad":
                 assert not call.function.arguments.startswith('{"raw":')
+
+
+class TestNameAsTagDialectRecovery:
+    """Regression tests for the name-as-tag tool-call dialect (#2604).
+
+    Qwen3.8-27B-oQ5e-mtp occasionally emits a tool call as
+    ``<read><filePath>VALUE</filePath></read>`` instead of the
+    ``qwen3_coder`` dialect its own chat template mandates.  mlx-lm's native
+    parser raises ``ValueError("No function provided.")`` on that shape and
+    the XML fallback did not know the dialect, so a fully recoverable call
+    was logged as "Dropping match" and thrown away.
+
+    The deviation is stochastic (the model samples at temperature 1.0 with
+    nothing constraining decoding), so it cannot be prompt-engineered away.
+    Recovery is gated on the declared tool list: ``<NAME>`` is only read as a
+    call when NAME is a tool the request actually declared, so arbitrary
+    XML-ish prose can never be mistaken for one.
+    """
+
+    SPECIMEN_PATH_A = (
+        "/Volumes/WorkSSD/repos/personal/penumbra/packages/agentchat/"
+        "src/adapters/acp-server.ts"
+    )
+    SPECIMEN_PATH_B = (
+        "/Volumes/WorkSSD/repos/personal/penumbra/packages/agentchat/"
+        "src/adapters/acp-client.ts"
+    )
+
+    # Verbatim shape of the ~/.omlx/logs/server.log:2431 emission: a
+    # name-as-tag block, then a second <tool_call> envelope holding another
+    # one.  The first envelope's payload therefore swallows both blocks.
+    SPECIMEN = (
+        "<tool_call>\n"
+        "<read>\n<filePath>\n" + SPECIMEN_PATH_A + "\n</filePath>\n</read>\n"
+        "<tool_call>\n"
+        "<read>\n<filePath>\n" + SPECIMEN_PATH_B + "\n</filePath>\n</read>\n"
+        "</tool_call>"
+    )
+
+    @staticmethod
+    def _read_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filePath": {"type": "string"},
+                            "offset": {"type": "integer"},
+                        },
+                        "required": ["filePath"],
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def _qwen_tokenizer():
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = mlx_qwen3_coder.tool_call_start
+        tok.tool_call_end = mlx_qwen3_coder.tool_call_end
+        tok.tool_parser = mlx_qwen3_coder.parse_tool_call
+        return tok
+
+    def test_native_parser_rejects_name_as_tag(self):
+        """Dispatch contract: mlx-lm raises, which is what routes the
+        emission into the oMLX fallback."""
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        with pytest.raises(ValueError):
+            mlx_qwen3_coder.parse_tool_call(
+                "\n<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>\n",
+                self._read_tools(),
+            )
+
+    def test_logged_specimen_recovers_both_reads(self):
+        """The exact dropped emission must yield both read calls."""
+        cleaned, calls = parse_tool_calls(
+            self.SPECIMEN, self._qwen_tokenizer(), self._read_tools()
+        )
+
+        assert calls is not None
+        assert [call.function.name for call in calls] == ["read", "read"]
+        assert [json.loads(call.function.arguments) for call in calls] == [
+            {"filePath": self.SPECIMEN_PATH_A},
+            {"filePath": self.SPECIMEN_PATH_B},
+        ]
+        assert "<read>" not in cleaned
+        assert "<tool_call>" not in cleaned
+
+    def test_bare_name_as_tag_block_recovers(self):
+        """A name-as-tag block with no <tool_call> envelope at all."""
+        text = "<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>"
+
+        cleaned, calls = parse_tool_calls(
+            text, self._qwen_tokenizer(), self._read_tools()
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.name == "read"
+        assert json.loads(calls[0].function.arguments) == {"filePath": "/etc/hosts"}
+        assert "<read>" not in cleaned
+
+    def test_name_as_tag_coerces_declared_types(self):
+        """Recovered values match the types the other dialects produce."""
+        text = (
+            "<tool_call>\n<read>\n<filePath>\n/etc/hosts\n</filePath>\n"
+            "<offset>\n12\n</offset>\n</read>\n</tool_call>"
+        )
+
+        _cleaned, calls = _parse_xml_tool_calls(text, self._read_tools())
+
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {
+            "filePath": "/etc/hosts",
+            "offset": 12,
+        }
+
+    def test_gate_rejects_tag_that_is_not_a_declared_tool(self):
+        """<NAME> is only a call when NAME was declared in `tools`."""
+        text = (
+            "<tool_call>\n<summary>\n<filePath>\n/etc/hosts\n</filePath>\n"
+            "</summary>\n</tool_call>"
+        )
+
+        _cleaned, calls = _parse_xml_tool_calls(text, self._read_tools())
+
+        assert calls is None
+
+    def test_gate_rejects_when_no_tools_declared(self):
+        """With no declared tool list there is nothing to gate on; fail closed."""
+        text = "<tool_call>\n<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>\n</tool_call>"
+
+        _cleaned, calls = _parse_xml_tool_calls(text, None)
+
+        assert calls is None
+
+    def test_bare_prose_with_declared_name_is_not_a_call(self):
+        """An unterminated tag must not be read as a call."""
+        text = "I will use <read> next, but not yet."
+
+        cleaned, calls = parse_tool_calls(
+            text, self._qwen_tokenizer(), self._read_tools()
+        )
+
+        assert calls is None
+        assert "<read>" in cleaned
+
+    def test_trailing_text_after_function_close_still_recovers(self):
+        """`_function_regex` is `$`-anchored, so trailing text defeats the
+        native parser; the fallback must still recover the call."""
+        text = (
+            "<tool_call>\n<function=read>\n"
+            "<parameter=filePath>\n/etc/hosts\n</parameter>\n"
+            "</function>\ntrailing chatter\n</tool_call>"
+        )
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._qwen_tokenizer(), self._read_tools()
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {"filePath": "/etc/hosts"}
+
+
+class TestArgumentLessToolCallFailsClosed:
+    """The native-parser SUCCESS path must not emit `"{}"` for a tool whose
+    schema requires parameters (#2604).
+
+    ``_parse_xml_function_call`` returns ``dict(name=..., arguments={})``
+    without raising when a ``<function=NAME>`` wrapper carries no
+    ``<parameter=`` children.  Serialised, that is a fully runnable tool call
+    with its arguments silently removed -- precisely the hazard the comment
+    above ``_serialize_tool_call_arguments`` argues against for the
+    serialisation-breach path.  This path produced no exception and therefore
+    no log line at all, which is why it was invisible.
+    """
+
+    @staticmethod
+    def _tokenizer(parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = parser
+        return tok
+
+    @staticmethod
+    def _tool(name, properties, required=None):
+        params = {"type": "object", "properties": properties}
+        if required is not None:
+            params["required"] = required
+        return {"type": "function", "function": {"name": name, "parameters": params}}
+
+    def test_argument_less_call_for_required_schema_is_dropped(self, caplog):
+        """`write_file` must not fire with nothing to write."""
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        tools = [
+            self._tool(
+                "write_file",
+                {"path": {"type": "string"}, "content": {"type": "string"}},
+                required=["path", "content"],
+            )
+        ]
+        text = "<tool_call>\n<function=write_file>\n</function>\n</tool_call>"
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = parse_tool_calls(
+                text, self._tokenizer(mlx_qwen3_coder.parse_tool_call), tools
+            )
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_argument_less_call_for_parameterless_tool_still_emitted(self):
+        """`{}` is the correct arguments value for a tool that takes none."""
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        tools = [self._tool("list_files", {})]
+        text = "<tool_call>\n<function=list_files>\n</function>\n</tool_call>"
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(mlx_qwen3_coder.parse_tool_call), tools
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.name == "list_files"
+        assert calls[0].function.arguments == "{}"
+
+    def test_argument_less_call_without_tools_preserves_legacy_behavior(self):
+        """With no declared schema we cannot know; do not guess."""
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        text = "<tool_call>\n<function=write_file>\n</function>\n</tool_call>"
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(mlx_qwen3_coder.parse_tool_call), None
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.arguments == "{}"
+
+    def test_argument_less_call_recovers_from_name_as_tag_body(self):
+        """Recovery is tried before the call is dropped."""
+        tools = [
+            self._tool(
+                "read", {"filePath": {"type": "string"}}, required=["filePath"]
+            )
+        ]
+        text = (
+            "<tool_call>\n<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>\n"
+            "</tool_call>"
+        )
+
+        def empty_args_parser(match, tools_arg):
+            return {"name": "read", "arguments": {}}
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(empty_args_parser), tools
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {"filePath": "/etc/hosts"}
+
+    def test_argument_less_drop_leaves_sibling_calls_alone(self):
+        """Dropping one call must not take the batch with it."""
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        tools = [
+            self._tool(
+                "write_file",
+                {"path": {"type": "string"}},
+                required=["path"],
+            ),
+            self._tool("list_files", {}),
+        ]
+        text = (
+            "<tool_call>\n<function=write_file>\n</function>\n</tool_call>\n"
+            "<tool_call>\n<function=list_files>\n</function>\n</tool_call>"
+        )
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(mlx_qwen3_coder.parse_tool_call), tools
+        )
+
+        assert [call.function.name for call in calls or []] == ["list_files"]
