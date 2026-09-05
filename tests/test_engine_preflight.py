@@ -103,16 +103,22 @@ class TestPreflightOrRaise:
         scheduler.preflight_or_raise(num_prompt_tokens=10**6)
 
     def test_accounts_for_cached_tokens(self, monkeypatch, caplog):
-        """A fully cached request must not be rejected even at a tiny limit."""
+        """A fully cached request must be admitted by PASSING the check,
+        not by skipping it. At a generous limit the floored 1-token
+        estimate fits and preflight_or_raise returns silently. The old
+        fail-open returned None from a credit-driven early return and
+        skipped the guard entirely regardless of the limit.
+        """
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = True
-        scheduler._memory_hard_limit_bytes = 1
+        scheduler._memory_hard_limit_bytes = 10**18
 
         import omlx.scheduler as scheduler_mod
 
         monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
         monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
 
+        # Fully cached at a generous limit: admitted by passing the check.
         scheduler.preflight_or_raise(num_prompt_tokens=10_000, cached_tokens=10_000)
 
         # A partial-cache rejection must log the credited cached_tokens so
@@ -120,6 +126,7 @@ class TestPreflightOrRaise:
         # cache-hit-continuation that was still over-budget.
         import logging
 
+        scheduler._memory_hard_limit_bytes = 1  # tighten for rejection
         with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
             with pytest.raises(PrefillMemoryExceededError):
                 scheduler.preflight_or_raise(

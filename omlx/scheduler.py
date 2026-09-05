@@ -10210,9 +10210,27 @@ class Scheduler:
         monitor = self.memory_monitor
         if monitor is None:
             return None
+        # --- credit-driven fail-open seam --------------------------------
+        # A credit (cached_tokens) must NEVER cause this guard to skip
+        # itself. Returning None here is reserved for the genuinely
+        # uninformative case (no monitor above, or no model info / zero
+        # estimate below) — a credit is a *claim* about the prompt, not
+        # missing data, and the route-time peek that supplies it
+        # (estimate_cached_prefix_tokens, :8568) can OVER-REPORT: it peeks
+        # with no extra_keys, so a prompt whose text matches a cached entry
+        # but whose images differ is reported as a hit, and LRU can drop the
+        # prefix between the peek and schedule. When the credit over-reports
+        # to >= the prompt length, new_tokens computes to 0 (or 1, which
+        # makes prefill_tokens 0) and the old early returns skipped the
+        # guard entirely — admitting the FULL prefill unchecked. Floor
+        # new_tokens to 1 so an exact/near-exact hit still prices its
+        # residency and is CHECKED, not admitted by skipping. A true
+        # full-cache hit then prices a 1-token prefill, which passes the
+        # check under normal memory but is rejected when memory is
+        # genuinely exhausted — admitted by passing, not by skipping.
         new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
-        if new_tokens == 0:
-            return None
+        if new_tokens < 1:
+            new_tokens = 1
         if self._prefill_speed_priority:
             charge_tokens = max(1, int(self.config.prefill_step_size))
         else:
@@ -10222,9 +10240,13 @@ class Scheduler:
         # pass its *pre-chunk* context to _predicted_chunk_transient, which
         # adds the query width exactly once. Passing N-1 here used to add the
         # floor chunk twice (issue #2521).
-        prefill_tokens = max(new_tokens - 1, 0)
-        if prefill_tokens == 0:
-            return None
+        # Floor prefill_tokens to 1 for the same reason new_tokens is
+        # floored: a 1-token prefill (new_tokens == 1, i.e. cached_tokens ==
+        # num_prompt_tokens - 1) is still real work that must be checked,
+        # not skipped. The floor-chunk charge below then prices a 1-token
+        # residency, which a true near-exact hit passes but an exhausted
+        # memory state does not.
+        prefill_tokens = max(new_tokens - 1, 1)
         floor_chunk = min(charge_tokens, prefill_tokens)
         kv_len = max(int(num_prompt_tokens) - 1 - floor_chunk, 0)
         # Route-time preflight charges the cached prefix as resident-to-be

@@ -210,14 +210,160 @@ def test_preflight_returns_none_when_guard_disabled():
     assert scheduler._preflight_memory_check(_make_request(65536)) is None
 
 
-def test_preflight_returns_none_when_request_fully_cached():
+def test_preflight_admits_fully_cached_request_by_passing_check():
+    """A true full-cache hit (cached_tokens == num_prompt_tokens) must
+    still be admitted — by PASSING the check, not by skipping it.
+
+    With a generous limit the 1-token floored estimate fits, so the guard
+    returns None (admitted). This replaces the old fail-open behaviour
+    where the guard returned None unconditionally for a full cache hit
+    regardless of the limit.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    req = _make_request(1000)
+    req.cached_tokens = 1000
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        assert scheduler._preflight_memory_check(req) is None
+
+
+def test_preflight_rejects_fully_cached_request_under_pressure():
+    """The credit-driven fail-open: when cached_tokens == num_prompt_tokens
+    (exact over-credit) and memory is exhausted, the guard must REJECT
+    rather than skip. Previously _admission_estimate returned None from
+    the new_tokens == 0 early return and the guard was skipped entirely.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1  # any allocation exceeds
+    req = _make_request(1000)
+    req.cached_tokens = 1000
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        rejection = scheduler._preflight_memory_check(req)
+    assert rejection is not None, (
+        "guard must reject an exact over-credit under pressure, not skip"
+    )
+    assert rejection.estimated_bytes > 0
+    assert rejection.limit_bytes == 1
+
+
+def test_preflight_rejects_near_exact_over_credit_under_pressure():
+    """EARLY RETURN 2 case: cached_tokens == num_prompt_tokens - 1 makes
+    new_tokens == 1, which made prefill_tokens == 0 and triggered the
+    second early return. The guard must still reject under pressure.
+    """
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
     scheduler._memory_hard_limit_bytes = 1
     req = _make_request(1000)
-    req.cached_tokens = 1000
-    # Fully cached: no new tokens to prefill, no peak to estimate.
-    assert scheduler._preflight_memory_check(req) is None
+    req.cached_tokens = 999  # new_tokens == 1 -> prefill_tokens floored to 1
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        rejection = scheduler._preflight_memory_check(req)
+    assert rejection is not None, (
+        "guard must reject a near-exact over-credit (new_tokens == 1), "
+        "not skip via the prefill_tokens == 0 early return"
+    )
+    assert rejection.estimated_bytes > 0
+
+
+def test_admission_estimate_exact_over_credit_returns_real_estimate():
+    """Direct unit test: cached_tokens == num_prompt_tokens must produce a
+    real _AdmissionEstimate, not None.
+    """
+    scheduler = _make_scheduler()
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=1000,
+        cached_tokens=1000,
+        current=0,
+    )
+    assert est is not None, (
+        "exact over-credit must yield a real estimate, not None"
+    )
+    assert est.kv_exact > 0
+    assert est.estimated > 0
+
+
+def test_admission_estimate_near_exact_over_credit_returns_real_estimate():
+    """Direct unit test: cached_tokens == num_prompt_tokens - 1 (the
+    EARLY RETURN 2 case) must produce a real _AdmissionEstimate, not None.
+    """
+    scheduler = _make_scheduler()
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=1000,
+        cached_tokens=999,
+        current=0,
+    )
+    assert est is not None, (
+        "near-exact over-credit (new_tokens == 1) must yield a real "
+        "estimate, not None"
+    )
+    assert est.kv_exact > 0
+    assert est.estimated > 0
+
+
+def test_admission_estimate_absurd_over_credit_returns_real_estimate():
+    """Direct unit test: cached_tokens > num_prompt_tokens (absurd
+    over-credit) must produce a real _AdmissionEstimate, not None, and
+    must not raise.
+    """
+    scheduler = _make_scheduler()
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=1000,
+        cached_tokens=2000,
+        current=0,
+    )
+    assert est is not None, (
+        "absurd over-credit must yield a real estimate, not None"
+    )
+    assert est.kv_exact > 0
+    assert est.estimated > 0
+
+
+def test_admission_estimate_returns_none_when_monitor_is_none():
+    """The genuinely-uninformative case: memory_monitor is None must still
+    return None. This is the only legitimate None path.
+    """
+    scheduler = _make_scheduler()
+    scheduler.memory_monitor = None
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=1000,
+        cached_tokens=1000,
+        current=0,
+    )
+    assert est is None
+
+
+def test_preflight_or_raise_rejects_exact_over_credit_under_pressure():
+    """Drive the fix through preflight_or_raise (cached_kv_resident=False),
+    not only via _admission_estimate directly. The route-time path gets
+    cached_tokens from the peek, which can over-report; when it does and
+    memory is tight, the guard must raise, not silently admit.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+        pytest.raises(PrefillMemoryExceededError) as exc,
+    ):
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=1000,
+            cached_tokens=1000,
+            request_id="req-over-credit",
+        )
+    assert exc.value.estimated_bytes > 0
+    assert exc.value.limit_bytes == 1
 
 
 def test_preflight_rejects_heavily_cached_long_context():
