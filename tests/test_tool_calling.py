@@ -4530,19 +4530,6 @@ class TestNameAsTagDialectRecovery:
         assert "<read>" not in cleaned
         assert "<tool_call>" not in cleaned
 
-    def test_bare_name_as_tag_block_recovers(self):
-        """A name-as-tag block with no <tool_call> envelope at all."""
-        text = "<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>"
-
-        cleaned, calls = parse_tool_calls(
-            text, self._qwen_tokenizer(), self._read_tools()
-        )
-
-        assert calls is not None and len(calls) == 1
-        assert calls[0].function.name == "read"
-        assert json.loads(calls[0].function.arguments) == {"filePath": "/etc/hosts"}
-        assert "<read>" not in cleaned
-
     def test_name_as_tag_coerces_declared_types(self):
         """Recovered values match the types the other dialects produce."""
         text = (
@@ -4727,3 +4714,442 @@ class TestArgumentLessToolCallFailsClosed:
         )
 
         assert [call.function.name for call in calls or []] == ["list_files"]
+
+
+class TestEveryDialectFailsClosedOnRequiredArguments:
+    """No dialect may mint a runnable call with empty arguments when the
+    declared schema requires some (#2604).
+
+    Round 1 installed the gate on the ``<function=NAME>`` branch only, so the
+    generic-JSON, name-as-tag, GLM, Hermes and namespaced branches each still
+    reached ``_build_tool_call`` directly.  ``write_file`` firing with nothing
+    to write is the same hazard on every one of them, so the gate belongs at
+    every emission site rather than on the branch where it was first noticed.
+    """
+
+    @staticmethod
+    def _tool(name, properties, required=None):
+        params = {"type": "object", "properties": properties}
+        if required is not None:
+            params["required"] = required
+        return {"type": "function", "function": {"name": name, "parameters": params}}
+
+    @classmethod
+    def _write_file_tools(cls):
+        return [
+            cls._tool(
+                "write_file",
+                {"path": {"type": "string"}, "content": {"type": "string"}},
+                required=["path", "content"],
+            )
+        ]
+
+    @staticmethod
+    def _tokenizer():
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        return tok
+
+    def test_name_as_tag_dialect_is_gated(self, caplog):
+        """`<tool_call><write_file>oops</write_file></tool_call>` (defect A)."""
+        text = "<tool_call>\n<write_file>\noops\n</write_file>\n</tool_call>"
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_xml_tool_calls(text, self._write_file_tools())
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_generic_json_dialect_is_gated(self, caplog):
+        """`<tool_call>{"name": ..., "arguments": {}}</tool_call>` (defect D)."""
+        text = '<tool_call>{"name": "write_file", "arguments": {}}</tool_call>'
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_xml_tool_calls(text, self._write_file_tools())
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_glm_dialect_is_gated(self, caplog):
+        """A GLM payload whose `<arg_key>` has no matching `<arg_value>`."""
+        text = "<tool_call>write_file<arg_key>path</arg_key></tool_call>"
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_xml_tool_calls(text, self._write_file_tools())
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_hermes_json_dialect_is_gated(self, caplog):
+        """`<|tool_call_start|>{"name": ..., "arguments": {}}` (defect D)."""
+        text = (
+            '<|tool_call_start|>{"name": "write_file", "arguments": {}}'
+            "<|tool_call_end|>"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_hermes_tool_calls(text, self._write_file_tools())
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_hermes_bracket_dialect_is_gated(self, caplog):
+        """`<|tool_call_start|>[write_file()]` (defect D)."""
+        text = "<|tool_call_start|>[write_file()]<|tool_call_end|>"
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_hermes_tool_calls(text, self._write_file_tools())
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_namespaced_invoke_dialect_is_gated(self, caplog):
+        """`<minimax:tool_call><invoke name="write_file"></invoke>`."""
+        text = (
+            '<minimax:tool_call><invoke name="write_file"></invoke>'
+            "</minimax:tool_call>"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_namespaced_tool_calls(
+                text, "minimax", self._write_file_tools()
+            )
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_no_dialect_emits_a_runnable_empty_call(self):
+        """Walk every dialect at once: none may reach the client."""
+        tools = self._write_file_tools()
+        payloads = [
+            "<tool_call>\n<function=write_file>\n</function>\n</tool_call>",
+            "<tool_call>\n<write_file>\noops\n</write_file>\n</tool_call>",
+            '<tool_call>{"name": "write_file", "arguments": {}}</tool_call>',
+            "<tool_call>write_file<arg_key>path</arg_key></tool_call>",
+        ]
+        for text in payloads:
+            _cleaned, calls = _parse_xml_tool_calls(text, tools)
+            assert not calls, f"runnable empty call minted by: {text!r}"
+
+        for text in (
+            '<|tool_call_start|>{"name": "write_file", "arguments": {}}'
+            "<|tool_call_end|>",
+            "<|tool_call_start|>[write_file()]<|tool_call_end|>",
+        ):
+            _cleaned, calls = _parse_hermes_tool_calls(text, tools)
+            assert not calls, f"runnable empty call minted by: {text!r}"
+
+    def test_parameterless_tool_still_emits_empty_object(self):
+        """`{}` stays correct for a tool that declares no required params."""
+        tools = [self._tool("list_files", {})]
+
+        for text, expected in (
+            ("<tool_call>\n<list_files>\n</list_files>\n</tool_call>", "name-as-tag"),
+            ('<tool_call>{"name": "list_files", "arguments": {}}</tool_call>', "json"),
+        ):
+            _cleaned, calls = _parse_xml_tool_calls(text, tools)
+            assert calls is not None and len(calls) == 1, expected
+            assert calls[0].function.name == "list_files"
+            assert calls[0].function.arguments == "{}"
+
+        _cleaned, calls = _parse_hermes_tool_calls(
+            '<|tool_call_start|>{"name": "list_files", "arguments": {}}'
+            "<|tool_call_end|>",
+            tools,
+        )
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.arguments == "{}"
+
+    def test_without_tools_legacy_behaviour_is_preserved(self):
+        """With no declared schema we cannot know; do not guess."""
+        text = '<tool_call>{"name": "write_file", "arguments": {}}</tool_call>'
+
+        _cleaned, calls = _parse_xml_tool_calls(text, None)
+
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.arguments == "{}"
+
+        _cleaned, calls = _parse_hermes_tool_calls(
+            '<|tool_call_start|>{"name": "write_file", "arguments": {}}'
+            "<|tool_call_end|>"
+        )
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.arguments == "{}"
+
+    def test_truncated_name_as_tag_value_is_dropped_with_a_warning(self, caplog):
+        """A value carrying the literal close tag ends the span early.
+
+        The span then holds no complete child element, so the dialect yields
+        `{}`.  It must be dropped and NAMED, not emitted runnable: the silent
+        version of this cost two sessions to find.
+        """
+        text = (
+            "<tool_call>\n<read>\n<filePath>\n/tmp/a</read>b\n"
+            "</filePath>\n</read>\n</tool_call>"
+        )
+        tools = [
+            self._tool("read", {"filePath": {"type": "string"}}, required=["filePath"])
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = _parse_xml_tool_calls(text, tools)
+
+        assert not calls
+        assert "read" in caplog.text
+        assert "filePath" in caplog.text
+
+
+class TestNameAsTagRequiresAnEnvelope:
+    """Name-as-tag recovery happens ONLY inside a `<tool_call>` envelope.
+
+    Round 1 also scanned envelope-free output, which made the parser INVENT
+    calls out of ordinary markup and DELETE the matching text from the answer
+    (defect B).  See the seam comment in `_parse_tool_calls_impl`.
+    """
+
+    @staticmethod
+    def _tools(name, required):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {p: {"type": "string"} for p in required},
+                        "required": list(required),
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def _parameterless_tool(name):
+        """A tool the required-arguments gate cannot help with.
+
+        Declaring no required params makes `{}` a legitimate arguments value,
+        so the ONLY thing standing between ordinary markup and a fabricated
+        call is the envelope requirement.  Pins defect B independently.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    @staticmethod
+    def _tokenizer():
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = mlx_qwen3_coder.tool_call_start
+        tok.tool_call_end = mlx_qwen3_coder.tool_call_end
+        tok.tool_parser = mlx_qwen3_coder.parse_tool_call
+        return tok
+
+    def test_fenced_example_of_the_dialect_is_not_a_call(self):
+        """A model explaining its own tool format must not fire that tool."""
+        text = (
+            "To read a file, emit:\n\n"
+            "```xml\n"
+            "<read>\n<filePath>/etc/shadow</filePath>\n</read>\n"
+            "```\n\n"
+            "That is the whole dialect."
+        )
+
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), self._tools("read", ["filePath"])
+        )
+
+        assert calls is None
+        assert cleaned == text
+
+    def test_html_details_summary_is_not_a_call(self):
+        """`summary` is both an HTML element and a plausible tool name."""
+        text = (
+            "<details><summary>Click to expand</summary>\nbody text\n</details>"
+        )
+
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), self._parameterless_tool("summary")
+        )
+
+        assert calls is None
+        assert cleaned == text
+
+    def test_bare_name_as_tag_block_is_ordinary_content(self):
+        """Envelope-free markup is content, even in the exact call shape.
+
+        Replaces round 1's `test_bare_name_as_tag_block_recovers`: once the
+        envelope is gone a legitimate answer is indistinguishable from a call,
+        and inventing one is strictly worse than losing one.
+        """
+        text = "<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>"
+
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), self._tools("read", ["filePath"])
+        )
+
+        assert calls is None
+        assert cleaned == text
+
+    def test_enveloped_block_still_recovers(self):
+        """The narrowing must not touch the enveloped path."""
+        text = (
+            "<tool_call>\n<read>\n<filePath>\n/etc/hosts\n</filePath>\n"
+            "</read>\n</tool_call>"
+        )
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), self._tools("read", ["filePath"])
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {"filePath": "/etc/hosts"}
+
+
+class TestHermesDialectFailsClosedEndToEnd:
+    """The `<|tool_call_start|>` branch reached `_build_tool_call` directly
+    because `parse_tool_calls` never handed it the declared `tools` at all
+    (defect D).  Proven end to end, through the public entry point."""
+
+    @staticmethod
+    def _tokenizer():
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+        return tok
+
+    @staticmethod
+    def _write_file_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+            }
+        ]
+
+    def test_hermes_json_empty_arguments_is_dropped(self, caplog):
+        text = (
+            '<|tool_call_start|>{"name": "write_file", "arguments": {}}'
+            "<|tool_call_end|>"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = parse_tool_calls(
+                text, self._tokenizer(), self._write_file_tools()
+            )
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_hermes_bracket_empty_arguments_is_dropped(self, caplog):
+        text = "<|tool_call_start|>[write_file()]<|tool_call_end|>"
+
+        with caplog.at_level(logging.WARNING):
+            _cleaned, calls = parse_tool_calls(
+                text, self._tokenizer(), self._write_file_tools()
+            )
+
+        assert not calls
+        assert "write_file" in caplog.text
+
+    def test_hermes_populated_call_still_fires(self):
+        text = (
+            '<|tool_call_start|>{"name": "write_file", '
+            '"arguments": {"path": "/tmp/a", "content": "hi"}}<|tool_call_end|>'
+        )
+
+        _cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(), self._write_file_tools()
+        )
+
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments) == {
+            "path": "/tmp/a",
+            "content": "hi",
+        }
+
+
+class TestNameAsTagIsNotDoubleEmitted:
+    """No block may reach the client as BOTH visible content and a call.
+
+    ``ToolCallStreamFilter`` is envelope-bounded, so it suppresses a
+    name-as-tag block only when that block sits inside a ``<tool_call>``
+    envelope.  Round 1's envelope-free scan minted calls from blocks the
+    filter had already streamed as content -- the same markup arriving twice
+    (defect C).  Restricting recovery to the envelope makes the parser's
+    recognition set a subset of the filter's suppression set, which is what
+    closes it structurally rather than by a second suppression rule.
+    """
+
+    SPECIMEN = (
+        "<tool_call>\n<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>\n"
+        "</tool_call>"
+    )
+
+    @staticmethod
+    def _read_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"filePath": {"type": "string"}},
+                        "required": ["filePath"],
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def _tokenizer():
+        from mlx_lm.tool_parsers import qwen3_coder as mlx_qwen3_coder
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = mlx_qwen3_coder.tool_call_start
+        tok.tool_call_end = mlx_qwen3_coder.tool_call_end
+        tok.tool_parser = mlx_qwen3_coder.parse_tool_call
+        return tok
+
+    def test_enveloped_block_is_a_call_and_is_suppressed_from_content(self):
+        """Recovered as a call, and never streamed as visible content."""
+        _cleaned, calls = parse_tool_calls(
+            self.SPECIMEN, self._tokenizer(), self._read_tools()
+        )
+        assert calls is not None and len(calls) == 1
+
+        f = ToolCallStreamFilter(_make_tokenizer_with_end("<tool_call>", "</tool_call>"))
+        streamed = f.feed(self.SPECIMEN) + f.finish()
+        assert "<read>" not in streamed
+        assert "/etc/hosts" not in streamed
+
+    def test_bare_block_is_content_and_is_not_a_call(self):
+        """The converse: what the filter streams must not also become a call."""
+        bare = "<read>\n<filePath>\n/etc/hosts\n</filePath>\n</read>"
+
+        f = ToolCallStreamFilter(_make_tokenizer_with_end("<tool_call>", "</tool_call>"))
+        streamed = f.feed(bare) + f.finish()
+        assert "<read>" in streamed
+
+        _cleaned, calls = parse_tool_calls(bare, self._tokenizer(), self._read_tools())
+        assert calls is None

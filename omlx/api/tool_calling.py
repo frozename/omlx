@@ -211,6 +211,31 @@ def _missing_required_arguments(
     return _tool_required_params(name, tools)
 
 
+def _emit_gated_tool_call(
+    name: str, arguments: Any, tools: Optional[List], raw_match: str
+) -> Optional[ToolCall]:
+    """Build a call, dropping it with a named warning if it lost every
+    required argument.
+
+    The single-dialect version of ``_emit_parsed_tool_call``: no XML-fallback
+    recovery attempt, because the caller IS a fallback dialect and there is
+    nothing further to try.  Used by every emission site that cannot fall
+    through to another dialect, so no branch can reintroduce the
+    argument-less-call hazard by forgetting the check (#2604).
+    """
+    required = _missing_required_arguments(name, arguments, tools)
+    if not required:
+        return _build_tool_call(name, arguments)
+    logger.warning(
+        "Dropping tool call %.80r: the dialect recovered no arguments but the "
+        "declared schema requires %s. Match: %r",
+        name,
+        required,
+        raw_match[:200],
+    )
+    return None
+
+
 def _emit_parsed_tool_call(
     name: str, arguments: Any, tools: Optional[List], raw_match: str
 ) -> Optional[ToolCall]:
@@ -733,6 +758,10 @@ def _iter_name_as_tag_spans(
     chat template mandates (#2604).  ``<NAME>`` is recognised ONLY when NAME
     is a tool the request declared: without that gate any XML-ish model output
     could be misread as a tool call, so the missing tool list fails closed.
+
+    Callers MUST restrict ``text`` to a ``<tool_call>`` payload.  The declared
+    name is not on its own enough to tell a call from prose -- see the seam
+    comment in ``_parse_tool_calls_impl``.
     """
     names = _declared_tool_names(tools)
     if not names:
@@ -767,19 +796,6 @@ def _name_as_tag_arguments(name: str, body: str, tools: Optional[List]) -> dict:
     return arguments
 
 
-def _spans_outside(
-    spans: List[Tuple[int, int]], length: int
-) -> Iterator[Tuple[int, int]]:
-    """Yield the gaps between (already ordered, non-overlapping) spans."""
-    cursor = 0
-    for start, end in spans:
-        if start > cursor:
-            yield cursor, start
-        cursor = max(cursor, end)
-    if cursor < length:
-        yield cursor, length
-
-
 def _parse_xml_tool_calls(
     text: str, tools: Optional[List] = None
 ) -> Tuple[str, Optional[List[ToolCall]]]:
@@ -790,10 +806,10 @@ def _parse_xml_tool_calls(
     - GLM format: <tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
     - Qwen/Llama format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
     - Generic JSON: <tool_call>{"name": ..., "arguments": ...}</tool_call>
-    - Name-as-tag: <tool_call><read><filePath>v</filePath></read></tool_call>,
-      and the same block emitted bare with no envelope at all (#2604).  That
-      one dialect is gated on ``tools``, since ``<NAME>`` is otherwise
-      indistinguishable from ordinary markup.
+    - Name-as-tag: <tool_call><read><filePath>v</filePath></read></tool_call>
+      (#2604).  That one dialect is additionally gated on ``tools``, since
+      ``<NAME>`` is otherwise indistinguishable from ordinary markup -- and
+      it is read ONLY inside the envelope, never from bare output.
 
     When ``tools`` is provided, parameter values are coerced to their
     declared schema types instead of best-effort JSON parsing.
@@ -801,62 +817,74 @@ def _parse_xml_tool_calls(
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
     """
-    # (text offset, call) pairs so envelope and bare recoveries come back in
-    # document order.  The sort is stable, so calls sharing one envelope keep
-    # the order their payload emitted them in.
-    collected: List[Tuple[int, ToolCall]] = []
+    tool_calls: List[ToolCall] = []
     envelope_spans: List[Tuple[int, int]] = []
 
     for span_start, span_end, payload in _iter_marker_spans(
         text, "<tool_call>", "</tool_call>"
     ):
         envelope_spans.append((span_start, span_end))
-        for call in _parse_xml_tool_call_payload(payload, tools):
-            collected.append((span_start, call))
+        tool_calls.extend(_parse_xml_tool_call_payload(payload, tools))
 
-    # Name-as-tag blocks emitted with no envelope, scanned only in the gaps
-    # between envelopes so an already-parsed payload is never read twice.
-    bare_spans: List[Tuple[int, int]] = []
-    for region_start, region_end in _spans_outside(envelope_spans, len(text)):
-        region = text[region_start:region_end]
-        for start, end, name, body in _iter_name_as_tag_spans(region, tools):
-            built = _build_tool_call(
-                name, _name_as_tag_arguments(name, body, tools)
-            )
-            if built is not None:
-                collected.append((region_start + start, built))
-                bare_spans.append((region_start + start, region_start + end))
-
-    if not collected:
+    if not tool_calls:
         return text, None
 
-    collected.sort(key=lambda item: item[0])
-    tool_calls = [call for _offset, call in collected]
-
     # Remove tool call tags from text
-    cleaned = _strip_spans(text, sorted(envelope_spans + bare_spans)).strip()
+    cleaned = _strip_spans(text, envelope_spans).strip()
     return cleaned, tool_calls
 
 
 def _parse_xml_tool_call_payload(
     payload: str, tools: Optional[List]
 ) -> List[ToolCall]:
-    """Parse one ``<tool_call>`` payload into zero or more calls."""
+    """Parse one ``<tool_call>`` payload into zero or more calls.
+
+    Every dialect below emits through ``gate``, never through
+    ``_build_tool_call`` directly: an argument-less runnable call is the same
+    hazard whichever dialect produced it, and round 1 shipped the check on
+    only the branch where it was first noticed (#2604).
+    """
     content = payload.strip()
+
+    # Names a dialect produced but whose required arguments it lost.  Recorded
+    # rather than logged on the spot, because a later dialect may still read
+    # the same payload successfully; whatever is left unrecovered is logged
+    # once at the end so a drop is never silent.
+    gated: List[Tuple[str, List[str]]] = []
+
+    def gate(name: str, arguments: Any) -> Optional[ToolCall]:
+        required = _missing_required_arguments(name, arguments, tools)
+        if required:
+            gated.append((name, required))
+            return None
+        return _build_tool_call(name, arguments)
+
+    def finish(calls: List[ToolCall]) -> List[ToolCall]:
+        emitted = {call.function.name for call in calls}
+        for name, required in gated:
+            if name in emitted:
+                # Another dialect recovered this same call; not a drop.
+                continue
+            logger.warning(
+                "Dropping tool call %.80r: no dialect recovered arguments but "
+                "the declared schema requires %s. Payload: %r",
+                name,
+                required,
+                content[:200],
+            )
+        return calls
 
     try:
         # Try JSON format first: {"name": "func", "arguments": {...}}
         parsed = json.loads(content, strict=False)
         name = parsed.get("name", "")
         arguments = parsed.get("arguments", {})
-        built = _build_tool_call(name, arguments)
-        return [built] if built is not None else []
+        # A payload that decodes as JSON IS the JSON dialect, so there is no
+        # later dialect to fall through to: gate and finish here.
+        built = gate(name, arguments)
+        return finish([built] if built is not None else [])
     except (json.JSONDecodeError, AttributeError, *_DEEP_NEST_ERRORS):
         pass
-
-    # Set when a dialect yielded a name but lost every required argument, so
-    # the payload is dropped rather than emitted runnable-but-empty (#2604).
-    gated: Optional[Tuple[str, List[str]]] = None
 
     # Qwen/Llama format: <function=name><parameter=key>value</parameter></function>
     # Bounded by rfind rather than a non-greedy match: the payload is already
@@ -871,25 +899,27 @@ def _parse_xml_tool_call_payload(
         arguments = {}
         for key, val in _iter_xml_parameters(params_text):
             arguments[key] = _coerce_param_value(val, key, props, func_name)
-        required = _missing_required_arguments(func_name, arguments, tools)
-        if not required:
-            built = _build_tool_call(func_name, arguments)
-            return [built] if built is not None else []
+        built = gate(func_name, arguments)
+        if built is not None:
+            return finish([built])
         # This dialect produced nothing usable; fall through and let the
         # remaining dialects read the same payload before it is dropped.
-        gated = (func_name, required)
 
     # Name-as-tag format: <read><filePath>value</filePath></read> (#2604).
     # Gated on the declared tool list; a payload may carry several blocks
     # because a nested <tool_call> lets one envelope swallow the next.
+    #
+    # A value containing the literal `</NAME>` ends the span early, leaving a
+    # body with no complete child element and therefore no arguments -- which
+    # `gate` turns into a named warning instead of a runnable empty call.
     name_as_tag = [
         built
         for _s, _e, name, body in _iter_name_as_tag_spans(content, tools)
-        if (built := _build_tool_call(name, _name_as_tag_arguments(name, body, tools)))
+        if (built := gate(name, _name_as_tag_arguments(name, body, tools)))
         is not None
     ]
     if name_as_tag:
-        return name_as_tag
+        return finish(name_as_tag)
 
     # GLM XML format: func_name<arg_key>k</arg_key><arg_value>v</arg_value>...
     arg_keys = re.findall(r"<arg_key>(.*?)</arg_key>", content)
@@ -906,18 +936,10 @@ def _parse_xml_tool_call_payload(
         arguments = {}
         for k, v in zip(arg_keys, arg_values):
             arguments[k] = _coerce_param_value(v, k, props, func_name)
-        built = _build_tool_call(func_name, arguments)
-        return [built] if built is not None else []
+        built = gate(func_name, arguments)
+        return finish([built] if built is not None else [])
 
-    if gated is not None:
-        logger.warning(
-            "Dropping tool call %.80r: no dialect recovered arguments but the "
-            "declared schema requires %s. Payload: %r",
-            gated[0],
-            gated[1],
-            content[:200],
-        )
-    return []
+    return finish([])
 
 
 def _parse_namespaced_tool_calls(
@@ -957,7 +979,9 @@ def _parse_namespaced_tool_calls(
                 key = pm.group(1)
                 val = pm.group(2).strip()
                 arguments[key] = _coerce_param_value(val, key, props, func_name)
-            _built = _build_tool_call(func_name, arguments)
+            _built = _emit_gated_tool_call(
+                func_name, arguments, tools, invoke_match.group(0)
+            )
             if _built is not None:
                 tool_calls.append(_built)
 
@@ -968,7 +992,9 @@ def _parse_namespaced_tool_calls(
     return cleaned, tool_calls
 
 
-def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+def _parse_hermes_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for Hermes-style tool call formats.
 
@@ -980,6 +1006,11 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         <|tool_call_start|>{"name": "func", "arguments": {...}}<|tool_call_end|>
 
     Some clients/agents emit tool calls using this Hermes-style wire format.
+
+    ``tools`` is the declared tool list; when given, a call that lost every
+    required argument is dropped with a warning rather than emitted runnable
+    and empty (#2604).  It defaults to ``None`` so callers that genuinely have
+    no schema keep the historical behaviour.
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
@@ -996,7 +1027,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             name = parsed.get("name", "")
             arguments = parsed.get("arguments", {})
             if name:
-                _built = _build_tool_call(name, arguments)
+                _built = _emit_gated_tool_call(name, arguments, tools, content)
                 if _built is not None:
                     tool_calls.append(_built)
                 continue
@@ -1055,7 +1086,7 @@ def _parse_hermes_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
                 )
                 continue
 
-            _built = _build_tool_call(func_name, arguments)
+            _built = _emit_gated_tool_call(func_name, arguments, tools, content)
             if _built is not None:
                 tool_calls.append(_built)
 
@@ -1954,12 +1985,22 @@ def _parse_tool_calls_impl(
     if "<tool_call>" in cleaned_text:
         return _parse_xml_tool_calls(cleaned_text, tools)
 
-    # Fallback: the name-as-tag dialect emitted with no envelope at all,
-    # e.g. <read><filePath>…</filePath></read> (#2604).  Gated on a declared
-    # tool name actually appearing as a closed tag, so ordinary markup in
-    # prose can never be promoted to a tool call.
-    if any(True for _span in _iter_name_as_tag_spans(cleaned_text, tools)):
-        return _parse_xml_tool_calls(cleaned_text, tools)
+    # DELIBERATELY ABSENT: an envelope-free scan for the name-as-tag dialect,
+    # e.g. a bare <read><filePath>…</filePath></read> (#2604).  Do not restore
+    # it.  A declared tool name is NOT sufficient evidence of a call once the
+    # <tool_call> envelope is gone, and no amount of pattern-tightening can
+    # make it sufficient: a legitimate answer may contain the exact dialect --
+    # a model explaining its own tool format inside a ```xml fence, or plain
+    # HTML whose element name collides with a tool (<details><summary>… with a
+    # tool named `summary`; likewise search/output/code/title/label).  Scanning
+    # those minted a call the model never made AND deleted the matching text
+    # from the answer, on every response rather than only enveloped ones.
+    # Losing a tool call is recoverable by a retry; fabricating one -- with a
+    # model- or attacker-chosen path -- is not.  The logged specimen that
+    # motivated the dialect DOES carry an envelope (server.log:2431: the model
+    # opened a second <tool_call> without closing the first, so one payload
+    # swallows both blocks), so it recovers through _parse_xml_tool_calls
+    # above; the envelope-free scan bought nothing it does not already give.
 
     # Fallback: namespaced tool_call tags (e.g. <minimax:tool_call>)
     ns_match = re.search(r"<([A-Za-z_][\w.-]*):tool_call>", cleaned_text)
@@ -1969,7 +2010,7 @@ def _parse_tool_calls_impl(
 
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
-        hermes_result = _parse_hermes_tool_calls(cleaned_text)
+        hermes_result = _parse_hermes_tool_calls(cleaned_text, tools)
         if hermes_result[1] is not None:
             return hermes_result
 
