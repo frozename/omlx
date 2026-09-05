@@ -5027,7 +5027,7 @@ async def create_chat_completion(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(raw_text)
             cleaned_thinking = sanitize_tool_call_markup(
-                thinking_content, engine.tokenizer
+                thinking_content, engine.tokenizer, tools_for_template
             )
 
             # Protocol parsers can return structured tool_calls directly.
@@ -5842,12 +5842,16 @@ async def stream_chat_completion(
     thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer, tools=kwargs.get("tools")
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            consume_dsml_separator=False,
+            tools=kwargs.get("tools"),
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -6273,12 +6277,16 @@ async def stream_anthropic_messages(
     tool_filter = None
     thinking_filter = None
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer, tools=kwargs.get("tools")
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            consume_dsml_separator=False,
+            tools=kwargs.get("tools"),
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -6962,7 +6970,7 @@ async def create_anthropic_message(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(raw_text)
             cleaned_thinking = sanitize_tool_call_markup(
-                thinking_content, engine.tokenizer
+                thinking_content, engine.tokenizer, internal_tools
             )
 
             # Protocol parsers can return structured tool_calls directly.
@@ -7543,7 +7551,7 @@ async def create_response(
                 tool_calls = _convert_parser_tool_calls(output.tool_calls)
                 cleaned_text = regular_content
                 cleaned_thinking = sanitize_tool_call_markup(
-                    thinking_content, engine.tokenizer
+                    thinking_content, engine.tokenizer, tools_for_template
                 )
             else:
                 extraction = extract_tool_calls_with_thinking(
@@ -7917,12 +7925,16 @@ async def stream_responses_api(
     thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer, tools=kwargs.get("tools")
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            consume_dsml_separator=False,
+            tools=kwargs.get("tools"),
         )
         if _content_filter.active:
             tool_filter = _content_filter

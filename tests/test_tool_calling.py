@@ -2059,6 +2059,143 @@ class TestParseBracketToolCalls:
         assert args == {"command": "python3 script.py", "timeout": 400}
 
 
+class TestBracketDialectGating:
+    """Bracket markup inside running prose is a quotation, not a call.
+
+    ``[Calling tool: name(args)]`` is oMLX's own history-serializer markup
+    (#159), never a native model dialect; the fallback exists only because a
+    model can mimic serialized conversation history.  When a tools list is
+    declared, a bracket span mints a call only for a declared name and only
+    when nothing but whitespace and further bracket markup follows it, so a
+    bracket quoted inside a sentence can no longer fabricate a runnable call
+    and delete the prose around it.  With no declared tools the dialect
+    fails open, matching the ``_missing_required_arguments`` precedent.
+    """
+
+    BASH_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+
+    SPECIMEN = (
+        'For example [Calling tool: bash({"cmd": "rm -rf /"})] '
+        "is what NOT to do."
+    )
+
+    def test_prose_quoted_bracket_mints_no_call_and_preserves_text(self):
+        """The prose specimen mints no call and leaves the sentence intact."""
+        cleaned, tool_calls = parse_tool_calls(
+            self.SPECIMEN, _make_tokenizer(), tools=self.BASH_TOOLS
+        )
+        assert tool_calls is None
+        assert cleaned == self.SPECIMEN
+
+    def test_prose_quoted_bracket_fails_open_without_tools(self):
+        """No declared tools: today's ungated behaviour is preserved."""
+        cleaned, tool_calls = parse_tool_calls(self.SPECIMEN, _make_tokenizer())
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "bash"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "cmd": "rm -rf /"
+        }
+        assert "[Calling tool:" not in cleaned
+        assert "For example" in cleaned
+        assert "is what NOT to do." in cleaned
+
+    def test_declared_trailing_call_still_parses(self):
+        """A bare bracket call for a declared tool is still recovered."""
+        text = '[Calling tool: bash({"command": "ls"})]'
+        cleaned, tool_calls = parse_tool_calls(
+            text, _make_tokenizer(), tools=self.BASH_TOOLS
+        )
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "bash"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "command": "ls"
+        }
+        assert cleaned == ""
+
+    def test_declared_call_after_prose_still_parses(self):
+        """Serializer layout (content then call lines at the end) still works."""
+        text = 'On it.\n[Calling tool: bash({"command": "ls"})]'
+        cleaned, tool_calls = parse_tool_calls(
+            text, _make_tokenizer(), tools=self.BASH_TOOLS
+        )
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "bash"
+        assert cleaned == "On it."
+
+    def test_undeclared_bracket_name_refused_and_text_preserved(self):
+        """A bracket naming an undeclared tool is prose and stays in the text."""
+        text = '[Calling tool: rm_rf({"path": "/"})]'
+        cleaned, tool_calls = parse_tool_calls(
+            text, _make_tokenizer(), tools=self.BASH_TOOLS
+        )
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_args_less_form_dropped_when_schema_requires_params(self):
+        """``[Tool call: name]`` must not mint a call missing required args."""
+        text = "[Tool call: bash]"
+        cleaned, tool_calls = parse_tool_calls(
+            text, _make_tokenizer(), tools=self.BASH_TOOLS
+        )
+        assert tool_calls is None
+        assert cleaned == text
+
+    def test_stream_filter_does_not_delete_refused_bracket_span(self):
+        """The stream filter must not suppress a span the parser refuses."""
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=self.BASH_TOOLS)
+        text = self.SPECIMEN
+        out = "".join(
+            f.feed(text[i : i + 7]) for i in range(0, len(text), 7)
+        )
+        out += f.finish()
+        assert out == self.SPECIMEN
+
+    def test_stream_filter_passes_declared_bracket_through_when_gated(self):
+        """Declared-name markup also streams through: whether a bracket is a
+        call depends on text the filter has not seen yet, so suppressing it
+        could delete a span the final parse refuses to mint."""
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=self.BASH_TOOLS)
+        text = 'On it.\n[Calling tool: bash({"command": "ls"})]'
+        out = "".join(
+            f.feed(text[i : i + 5]) for i in range(0, len(text), 5)
+        )
+        out += f.finish()
+        assert out == text
+
+    def test_gemma4_fallback_drops_argumentless_call_for_required_tool(self):
+        """The Gemma 4 recovery path must route through the required-args gate."""
+
+        class RejectingTokenizer:
+            has_tool_calling = True
+            tool_call_start = "<|tool_call>"
+            tool_call_end = "<tool_call|>"
+
+            @staticmethod
+            def tool_parser(text, tools):
+                raise ValueError("native parser rejected")
+
+        text = "<|tool_call>call:bash{}<tool_call|>"
+        _cleaned, tool_calls = parse_tool_calls(
+            text, RejectingTokenizer(), tools=self.BASH_TOOLS
+        )
+        assert tool_calls is None
+
+
 class TestParseToolCallsWithThinkingFallback:
     """Tests for parse_tool_calls_with_thinking_fallback.
 

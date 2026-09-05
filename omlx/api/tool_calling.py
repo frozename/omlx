@@ -1099,23 +1099,41 @@ def _parse_hermes_tool_calls(
     return cleaned, tool_calls
 
 
-def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+def _parse_bracket_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for bracket-style tool call formats.
 
     Recognizes both ``[Calling tool: name(args)]`` and ``[Tool call: name(args)]``
-    prefixes, with or without arguments.  Models may emit the args-less form
-    ``[Tool call: name]`` when mimicking conversation history.
+    prefixes, with or without arguments.  The markup is oMLX's own
+    history-serializer format (#159) — a rendered assistant turn ends in
+    ``[Calling tool: ...]`` lines — never a native model dialect, so the
+    fallback exists only to recover a call when the model mimics serialized
+    conversation history.  Models may emit the args-less form
+    ``[Tool call: name]`` for the same reason.
+
+    When ``tools`` declares names, a bracket span counts as a call only for
+    a declared name AND only when nothing but whitespace and further bracket
+    markup follows it: calls sit in the trailing run of bracket markup.
+    A bracket embedded in running prose is the model quoting the transcript
+    format, and minting it would hand attacker-influenceable model output a
+    runnable call while deleting the sentence that produced it.  Refused
+    spans are left in the text untouched.  With no declared names the gate
+    cannot apply, so the historical ungated behaviour is kept — the same
+    fail-open rule ``_missing_required_arguments`` documents.
 
     Returns:
         Tuple of (cleaned_text, tool_calls or None)
     """
-    tool_calls = []
+    undecodable = object()
+    # (start, end, name, arguments) in document order; ``arguments`` is the
+    # ``undecodable`` sentinel when the payload could not be decoded at all.
+    candidates: List[Tuple[int, int, str, Any]] = []
     # Match with args first (higher fidelity)
     pattern_with_args = (
         r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\(({.*?})\)\]"
     )
-    matched_spans: list = []
     for match in re.finditer(pattern_with_args, text, re.DOTALL):
         name = match.group(1)
         args_str = match.group(2)
@@ -1129,41 +1147,63 @@ def _parse_bracket_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]
                 type(exc).__name__,
                 exc,
             )
-            matched_spans.append(match.span())
-            continue
+            arguments = undecodable
         except (json.JSONDecodeError, ValueError):
             arguments = {"raw": args_str}
-        _built = _build_tool_call(name, arguments)
-        if _built is not None:
-            tool_calls.append(_built)
-        matched_spans.append(match.span())
+        candidates.append((*match.span(), name, arguments))
 
     # Match without args (model-generated simplified form)
     pattern_no_args = r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\]"
     for match in re.finditer(pattern_no_args, text):
         # Skip if this span overlaps with an already-matched with-args span
         start, end = match.span()
-        if any(s <= start < e for s, e in matched_spans):
+        if any(s <= start < e for s, e, _n, _a in candidates):
             continue
-        name = match.group(1)
-        tool_calls.append(
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name,
-                    arguments="{}",
-                ),
-            )
-        )
-        matched_spans.append((start, end))
+        candidates.append((start, end, match.group(1), {}))
+    candidates.sort(key=lambda c: c[0])
+
+    declared = _declared_tool_names(tools)
+    if declared:
+        # Only the trailing run of bracket markup can be calls.  Walk the
+        # candidates backwards: a span stays in the run while only
+        # whitespace separates it from the next run member (or the end of
+        # the text), so prose AFTER a bracket disqualifies it while prose
+        # before it does not — the serializer appends call markup after the
+        # assistant's content, which is the shape a mimicking model emits.
+        run_start = len(candidates)
+        pos = len(text)
+        for i in range(len(candidates) - 1, -1, -1):
+            if text[candidates[i][1] : pos].strip():
+                break
+            run_start = i
+            pos = candidates[i][0]
+        mintable = [c for c in candidates[run_start:] if c[2] in declared]
+    else:
+        mintable = candidates
+
+    tool_calls = []
+    minted_spans: List[Tuple[int, int]] = []
+    for start, end, name, arguments in mintable:
+        if arguments is undecodable:
+            continue  # decode already warned; the span stays in the text
+        _built = _emit_gated_tool_call(name, arguments, tools, text[start:end])
+        if _built is not None:
+            tool_calls.append(_built)
+            minted_spans.append((start, end))
 
     if not tool_calls:
         return text, None
 
-    # Remove all matched spans from text
-    cleaned = re.sub(pattern_with_args, "", text, flags=re.DOTALL)
-    cleaned = re.sub(pattern_no_args, "", cleaned).strip()
+    if declared:
+        # Only spans that minted a call are removed; refused markup stays
+        # visible so no prose is silently lost.
+        cleaned = _strip_spans(text, minted_spans).strip()
+    else:
+        # Fail-open parity with the historical re.sub: every matched span
+        # is stripped, including ones that failed to mint.
+        cleaned = _strip_spans(
+            text, [(s, e) for s, e, _n, _a in candidates]
+        ).strip()
     return cleaned, tool_calls
 
 
@@ -1928,7 +1968,9 @@ def _parse_tool_calls_impl(
                             for p in items:
                                 name = p.get("name", "")
                                 arguments = p.get("arguments", {})
-                                _built = _build_tool_call(name, arguments)
+                                _built = _emit_gated_tool_call(
+                                    name, arguments, tools, match
+                                )
                                 if _built is not None:
                                     tool_calls.append(_built)
                             gemma4_handled = True
@@ -2016,7 +2058,7 @@ def _parse_tool_calls_impl(
 
     # Fallback: bracket tool call formats (from text-formatted history)
     if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
-        return _parse_bracket_tool_calls(cleaned_text)
+        return _parse_bracket_tool_calls(cleaned_text, tools)
 
     # All parsing attempts exhausted. Strip known tool-call markers so raw
     # control markup never leaks into the API response.  Models whose markers
@@ -2054,7 +2096,9 @@ def _parse_tool_calls_impl(
     return cleaned_text, None
 
 
-def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
+def sanitize_tool_call_markup(
+    text: str, tokenizer: Any, tools: Optional[List] = None
+) -> str:
     """Remove tool-call control markup while preserving surrounding prose."""
     if not text:
         return ""
@@ -2062,7 +2106,9 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     # Every caller sanitizes thinking-channel text; keep it byte-identical
     # with the streamed reasoning deltas, which do not consume DeepSeek
     # V4's separator either.
-    stream_filter = ToolCallStreamFilter(tokenizer, consume_dsml_separator=False)
+    stream_filter = ToolCallStreamFilter(
+        tokenizer, consume_dsml_separator=False, tools=tools
+    )
     cleaned = stream_filter.feed(text)
     cleaned += stream_filter.finish()
     return cleaned.strip()
@@ -2103,7 +2149,9 @@ def extract_tool_calls_with_thinking(
       of whether regular text was also produced.
     """
     cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
+    cleaned_thinking = sanitize_tool_call_markup(
+        thinking_content, tokenizer, tools
+    )
     tool_calls_from_thinking = False
 
     if not tool_calls and thinking_content:
@@ -2196,9 +2244,23 @@ class ToolCallStreamFilter:
             that never contains a separator-prefixed tool-call block (the
             thinking channel), where holding trailing newlines would flush
             them only after the channel closed.
+        tools: Tool definitions declared for the request.  When names are
+            declared, bracket-format markup (``[Calling tool: ...]`` /
+            ``[Tool call: ...]``) is passed through as ordinary text: the
+            non-streaming parser mints such a span only when nothing but
+            whitespace and further bracket markup follows it, a condition a
+            streaming filter cannot evaluate without seeing the future, so
+            suppressing the span could delete text the final parse refuses
+            to turn into a call.
     """
 
-    def __init__(self, tokenizer: Any, *, consume_dsml_separator: bool = True):
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        consume_dsml_separator: bool = True,
+        tools: Optional[List] = None,
+    ):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
         # Normalize None-like values but preserve empty strings.
@@ -2244,6 +2306,19 @@ class ToolCallStreamFilter:
         self._orphan_close_markers = list(dict.fromkeys(self._orphan_close_markers))
         self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
         self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
+        if _declared_tool_names(tools):
+            # DELIBERATELY OFF under a declared tool list: the bracket
+            # dialect mints a call only for a declared name and only in the
+            # trailing run of bracket markup (see _parse_bracket_tool_calls),
+            # and the second half of that rule cannot be evaluated until the
+            # rest of the stream has arrived.  Suppressing a bracket span
+            # here while the final parse refuses to mint it would convert a
+            # refused call into silent text loss, so the markup is treated
+            # as ordinary text — partial-prefix holding, EOF tail drops and
+            # prefix sanitizing all key off this list.  With no declared
+            # names the historical suppression behaviour is kept (fail-open,
+            # matching the parser).
+            self._bracket_prefixes = []
         self._bracket_call_re = re.compile(
             r"^\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]",
             re.DOTALL,
