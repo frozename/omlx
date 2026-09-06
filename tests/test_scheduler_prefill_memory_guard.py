@@ -2086,6 +2086,51 @@ def test_admission_estimate_raises_on_over_credit():
             )
 
 
+def test_admission_estimate_raises_on_over_credit_even_without_monitor():
+    """F4 hoist pin: the ``resident_kv_tokens`` range validation sits ABOVE
+    the ``memory_monitor is None`` early return, so the invariant holds
+    whether or not a monitor exists.  Without the hoist, a missing monitor
+    lets an out-of-range credit return None (fail-open) instead of raising.
+
+    The existing ``test_admission_estimate_raises_on_over_credit`` builds its
+    scheduler via ``_make_scheduler()``, which ALWAYS supplies a monitor, so
+    it passes identically with and without the hoist — it does not pin the
+    ordering.  This test pins BOTH halves of the hoist:
+
+    - out-of-range credit with ``memory_monitor = None`` MUST raise
+      ``ValueError`` (not return None)
+    - in-range credit with ``memory_monitor = None`` MUST still return None
+      (the monitor-absent early return is not accidentally deleted)
+
+    Mutation that must go RED: move the ``monitor = self.memory_monitor`` /
+    ``if monitor is None: return None`` block back above the F4 validation.
+    The out-of-range half will return None instead of raising.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    scheduler.memory_monitor = None
+
+    # Out-of-range with no monitor: MUST raise, not return None.
+    # resident_kv_tokens=900 > cached_tokens=500 → out of range.
+    with pytest.raises(ValueError, match="out of range"):
+        scheduler._admission_estimate(
+            num_prompt_tokens=1000, cached_tokens=500, current=0,
+            cached_kv_resident=False, resident_kv_tokens=900,
+        )
+
+    # In-range with no monitor: MUST still return None — the monitor-absent
+    # early return must not be deleted by the hoist.
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=1000, cached_tokens=500, current=0,
+        cached_kv_resident=False, resident_kv_tokens=100,
+    )
+    assert est is None, (
+        "in-range credit with no monitor must return None — the "
+        "monitor-absent early return must not be deleted"
+    )
+
+
 def test_combined_probe_stateful_full_hit_not_underpriced():
     """F3/M4: the combined probe applies the stateful exact-hit clamp
     internally.  A stateful full-cache hit returns ``cached_tokens=0``

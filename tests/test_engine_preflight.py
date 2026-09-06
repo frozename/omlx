@@ -1008,3 +1008,185 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "memory_guard_tier" in rej.message
         assert "iogpu.wired_limit_mb" not in rej.message
         assert "custom_ceiling_bytes" not in rej.message
+
+
+# ---------------------------------------------------------------------------
+# VLM preflight must price COLD (no cached-prefix credit)
+# ---------------------------------------------------------------------------
+#
+# This branch removed the cached/resident credit from the VLM preflight paths.
+# The VLM preflight peek walks an image-stripped, placeholder-free token stream
+# while the real prefill hashes an OCR-prompt + placeholder-bearing one, so a
+# credited prefix might never be reused while the charge subtracted it anyway
+# — an under-charge in a memory guard.
+#
+# The BatchedEngine TEXT path calls ``estimate_cached_prefix_for_admission``
+# and forwards the credit.  The VLM path must NOT call the probe and must
+# reach the scheduler with ``cached_tokens=0`` and ``resident_kv_tokens=0``.
+#
+# The spy on the probe is the load-bearing assertion: a future re-add could
+# pass the same numbers by coincidence (empty cache) while calling the probe,
+# so asserting the probe is NOT called catches the regression even when the
+# numbers happen to match.
+
+
+def _make_scheduler_with_resident_cache():
+    """Return (scheduler, manager) with a real PagedCacheManager populated
+    with resident blocks so ``estimate_cached_prefix_for_admission`` would
+    return non-zero values IF called.
+    """
+    from omlx.cache.paged_cache import PagedCacheManager, compute_block_hash
+
+    block_size = 4
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+    scheduler._memory_hard_watermark_bytes = 0
+    manager = PagedCacheManager(
+        block_size=block_size, max_blocks=200,
+        model_name="test-model", initial_blocks=200,
+    )
+    scheduler.block_aware_cache = manager
+    scheduler.config.paged_cache_block_size = block_size
+    scheduler._boundary_snapshot_required = False
+    scheduler._gdn_split_active = MagicMock(return_value=False)
+    scheduler._detect_boundary_snapshot_need = MagicMock(return_value=True)
+
+    # Insert 20 blocks (80 tokens) for token_ids 1..80 so the probe WOULD
+    # find a full resident hit if called.
+    token_ids = list(range(1, 81))
+    parent_hash = None
+    for i in range(len(token_ids) // block_size):
+        start = i * block_size
+        end = start + block_size
+        block_hash = compute_block_hash(
+            parent_hash, token_ids[start:end], model_name="test-model"
+        )
+        block = manager.allocate_block()
+        block.block_hash = block_hash
+        block.token_count = block_size
+        manager.cached_block_hash_to_block.insert(block_hash, block)
+        parent_hash = block_hash
+
+    return scheduler, manager, token_ids
+
+
+@pytest.mark.asyncio
+async def test_vlm_preflight_chat_prices_cold():
+    """VLM ``preflight_chat`` must NOT call ``estimate_cached_prefix_for_admission``
+    and must reach the scheduler with ``cached_tokens=0`` and
+    ``resident_kv_tokens=0``.
+
+    The scheduler has a populated resident cache so the probe WOULD return
+    non-zero values if called — making both the spy AND the number assertions
+    fail if a future change re-introduces the credit.
+
+    Mutation that must go RED: re-introduce a credit on the VLM preflight
+    path (probe ``estimate_cached_prefix_for_admission`` and forward its
+    values).  The spy catches the probe call; the number assertions catch
+    the non-zero forwarding.
+    """
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler, _manager, token_ids = _make_scheduler_with_resident_cache()
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+    # Tokenizer returns the cached token_ids so the probe WOULD find a hit.
+    engine._tokenizer.encode = MagicMock(return_value=list(token_ids))
+
+    # Spy on the probe — this is the load-bearing assertion.
+    original_probe = scheduler.estimate_cached_prefix_for_admission
+    probe_called = {"yes": False}
+
+    def probe_spy(_token_ids):
+        probe_called["yes"] = True
+        return original_probe(_token_ids)
+
+    scheduler.estimate_cached_prefix_for_admission = probe_spy  # type: ignore[assignment]
+
+    # Capture what reaches preflight_or_raise.
+    captured = {}
+
+    def capture_or_raise(**kwargs):
+        captured.update(kwargs)
+
+    scheduler.preflight_or_raise = capture_or_raise  # type: ignore[assignment]
+
+    try:
+        await engine.preflight_chat(
+            messages=[{"role": "user", "content": "hello"}],
+            request_id="req-vlm-cold",
+        )
+    finally:
+        scheduler.estimate_cached_prefix_for_admission = original_probe
+
+    assert not probe_called["yes"], (
+        "VLM preflight_chat must NOT call estimate_cached_prefix_for_admission "
+        "— the VLM peek stream differs from the real prefill stream, so a "
+        "credited prefix may never be reused while the charge subtracts it"
+    )
+    assert captured.get("cached_tokens") == 0, (
+        f"VLM preflight_chat must reach the scheduler with cached_tokens=0 "
+        f"(cold pricing), got {captured.get('cached_tokens')}"
+    )
+    assert captured.get("resident_kv_tokens") == 0, (
+        f"VLM preflight_chat must reach the scheduler with "
+        f"resident_kv_tokens=0 (cold pricing), got "
+        f"{captured.get('resident_kv_tokens')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_vlm_preflight_completion_prices_cold():
+    """VLM ``preflight_completion`` must NOT call
+    ``estimate_cached_prefix_for_admission`` and must reach the scheduler
+    with ``cached_tokens=0`` and ``resident_kv_tokens=0``.
+
+    Same rationale as ``test_vlm_preflight_chat_prices_cold`` — the
+    completion path must also price cold.
+
+    Mutation that must go RED: re-introduce a credit on the VLM completion
+    preflight path.
+    """
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    scheduler, _manager, token_ids = _make_scheduler_with_resident_cache()
+    engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+    engine._tokenizer.encode = MagicMock(return_value=list(token_ids))
+
+    original_probe = scheduler.estimate_cached_prefix_for_admission
+    probe_called = {"yes": False}
+
+    def probe_spy(_token_ids):
+        probe_called["yes"] = True
+        return original_probe(_token_ids)
+
+    scheduler.estimate_cached_prefix_for_admission = probe_spy  # type: ignore[assignment]
+
+    captured = {}
+
+    def capture_or_raise(**kwargs):
+        captured.update(kwargs)
+
+    scheduler.preflight_or_raise = capture_or_raise  # type: ignore[assignment]
+
+    try:
+        await engine.preflight_completion(
+            prompt="hello world",
+            request_id="req-vlm-cold-comp",
+        )
+    finally:
+        scheduler.estimate_cached_prefix_for_admission = original_probe
+
+    assert not probe_called["yes"], (
+        "VLM preflight_completion must NOT call "
+        "estimate_cached_prefix_for_admission"
+    )
+    assert captured.get("cached_tokens") == 0, (
+        f"VLM preflight_completion must reach the scheduler with "
+        f"cached_tokens=0 (cold pricing), got {captured.get('cached_tokens')}"
+    )
+    assert captured.get("resident_kv_tokens") == 0, (
+        f"VLM preflight_completion must reach the scheduler with "
+        f"resident_kv_tokens=0 (cold pricing), got "
+        f"{captured.get('resident_kv_tokens')}"
+    )
