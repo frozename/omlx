@@ -1477,8 +1477,6 @@ class VLMBatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
         text_only: bool = False,
-        cached_tokens: int = 0,
-        resident_kv_tokens: int = 0,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1491,8 +1489,6 @@ class VLMBatchedEngine(BaseEngine):
                 None,
             ),
             text_only=text_only,
-            cached_tokens=cached_tokens,
-            resident_kv_tokens=resident_kv_tokens,
         )
 
     @property
@@ -3898,8 +3894,14 @@ class VLMBatchedEngine(BaseEngine):
         # count that rejects borderline image-bearing prompts the real
         # chat path would have handled. The real ``chat`` flow itself
         # strips images first via ``extract_images_from_messages`` (see
-        # ``_process_chat_messages``), so mirroring that here keeps
-        # preflight and execution on the same template input.
+        # ``_process_chat_messages``).  NOTE: this peeked stream is NOT
+        # the stream the scheduler block-hashes at execution time — the
+        # real path goes through ``_process_chat_messages`` →
+        # ``_apply_ocr_prompt`` → ``_prepare_vision_inputs``, which
+        # applies the VLM template WITH per-message image placeholder
+        # tokens.  Preflight therefore prices cold (no cached-prefix
+        # credit) so a credited prefix that the scheduler never reuses
+        # cannot under-charge the guard.
         text_messages, _, _ = extract_images_from_messages(messages)
         prompt = self._apply_chat_template(
             text_messages,
@@ -3914,8 +3916,7 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            token_ids = self._tokenizer.encode(prompt)
-            num_tokens = len(token_ids)
+            num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -3938,31 +3939,11 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
-        # Cache probe runs on the text token_ids only — image placeholder
-        # tokens are not in the prefix cache (the peek uses no extra_keys,
-        # so VLM image-keyed blocks are invisible; see F15).  The image
-        # tokens are always charged as new, which is conservative.
-        cached = 0
-        resident_kv = 0
-        fn = getattr(scheduler, "estimate_cached_prefix_for_admission", None)
-        if fn is not None:
-            try:
-                estimate = fn(token_ids)
-                cached = int(estimate.cached_tokens)
-                resident_kv = int(estimate.resident_kv_tokens)
-            except Exception:
-                logger.debug(
-                    "VLMBatchedEngine.preflight_chat: cached-prefix "
-                    "estimate failed; pricing cold",
-                    exc_info=True,
-                )
         await self._preflight_or_raise_with_eviction(
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
             text_only=image_tokens == 0,
-            cached_tokens=cached,
-            resident_kv_tokens=resident_kv,
         )
 
     async def preflight_completion(
@@ -3981,8 +3962,7 @@ class VLMBatchedEngine(BaseEngine):
             )
             return
         try:
-            token_ids = self._tokenizer.encode(prompt)
-            num_tokens = len(token_ids)
+            num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_completion: tokenizer.encode "
@@ -3995,27 +3975,11 @@ class VLMBatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
-        cached = 0
-        resident_kv = 0
-        fn = getattr(scheduler, "estimate_cached_prefix_for_admission", None)
-        if fn is not None:
-            try:
-                estimate = fn(token_ids)
-                cached = int(estimate.cached_tokens)
-                resident_kv = int(estimate.resident_kv_tokens)
-            except Exception:
-                logger.debug(
-                    "VLMBatchedEngine.preflight_completion: cached-prefix "
-                    "estimate failed; pricing cold",
-                    exc_info=True,
-                )
         await self._preflight_or_raise_with_eviction(
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
             text_only=True,
-            cached_tokens=cached,
-            resident_kv_tokens=resident_kv,
         )
 
     async def stream_chat(

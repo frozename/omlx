@@ -10365,9 +10365,6 @@ class Scheduler:
         Returns None when nothing can be estimated (no model info and no
         measurements yet); callers skip the check, as before.
         """
-        monitor = self.memory_monitor
-        if monitor is None:
-            return None
         # --- F4: validate resident_kv_tokens (same fail-open class as bc5f09e3)
         # An unbounded resident_kv_tokens zeroes charge_kv_tokens, silently
         # bypassing the memory guard.  Raise ValueError on out-of-range input
@@ -10378,21 +10375,27 @@ class Scheduler:
         # Chose raise-over-clamp because this is a memory-guard seam — silent
         # clamping hid the dead-code bug (F1) for an entire review cycle; a
         # ValueError makes the next regression visible in the first test run.
+        # This check sits ABOVE the monitor-None gate so the invariant holds
+        # unconditionally — without the hoist, a missing monitor lets an
+        # out-of-range credit return None (fail-open) instead of raising.
         _rkv = int(resident_kv_tokens)
         _ct = max(0, int(cached_tokens))
         _npt = max(0, int(num_prompt_tokens))
         if _rkv < 0 or _rkv > _ct or _rkv > _npt:
             raise ValueError(
                 f"resident_kv_tokens={_rkv} out of range "
-                f"[0, min(cached_tokens={_ct}, num_prompt_tokens={_npt}))]"
+                f"[0, min(cached_tokens={_ct}, num_prompt_tokens={_npt})]"
             )
+        monitor = self.memory_monitor
+        if monitor is None:
+            return None
         # --- credit-driven fail-open seam --------------------------------
         # A credit (cached_tokens / resident_kv_tokens) must NEVER cause
         # this guard to skip itself. Returning None here is reserved for
         # the genuinely uninformative case (no monitor above, or no model
         # info / zero estimate below) — a credit is a *claim* about the
         # prompt, not missing data, and the route-time peek that supplies
-        # it (estimate_cached_prefix_for_admission, :8700) can OVER-REPORT:
+        # it (estimate_cached_prefix_for_admission) can OVER-REPORT:
         # it peeks with no extra_keys, so a prompt whose text matches a
         # cached entry but whose images differ is reported as a hit, and
         # LRU can drop the prefix between the peek and schedule. When the
