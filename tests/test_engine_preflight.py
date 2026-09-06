@@ -202,12 +202,14 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
         request_id="req-evict",
         text_only=True,
         cached_tokens=0,
+        resident_kv_tokens=0,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
         text_only=True,
         cached_tokens=0,
+        resident_kv_tokens=0,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -254,6 +256,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
         request_id="req-next",
         text_only=True,
         cached_tokens=0,
+        resident_kv_tokens=0,
     )
     evict.assert_not_awaited()
 
@@ -678,20 +681,24 @@ async def test_batched_engine_preflight_chat_credits_cached_prefix():
     """preflight_chat must credit the stored prefix so a cache
     hit-continuation is not priced as a cold prefill at HTTP time.
 
-    The engine calls ``scheduler.estimate_cached_prefix_tokens(token_ids)``
+    The engine calls ``scheduler.estimate_cached_prefix_for_admission(token_ids)``
     with the *encoded ids* (not the count) and forwards the result as
-    ``cached_tokens`` to both ``preflight_eviction_request`` and
-    ``preflight_or_raise``.  The estimate is read-only: it must NOT call
-    ``block_aware_cache.fetch_cache`` (which allocates and registers state).
+    ``cached_tokens`` and ``resident_kv_tokens`` to both
+    ``preflight_eviction_request`` and ``preflight_or_raise``.  The estimate
+    is read-only: it must NOT call ``block_aware_cache.fetch_cache`` (which
+    allocates and registers state).
 
-    Fail-closed: if the estimate raises, ``cached_tokens`` falls back to 0
+    Fail-closed: if the estimate raises, both values fall back to 0
     so the request is priced cold — same as today — never under-priced.
     """
     from omlx.engine.batched import BatchedEngine
+    from omlx.scheduler import CachedPrefixEstimate
 
     token_ids = [10, 20, 30, 40, 50]
     scheduler = MagicMock()
-    scheduler.estimate_cached_prefix_tokens = MagicMock(return_value=8)
+    scheduler.estimate_cached_prefix_for_admission = MagicMock(
+        return_value=CachedPrefixEstimate(cached_tokens=8, resident_kv_tokens=8)
+    )
     scheduler.preflight_eviction_request = MagicMock(return_value=None)
     scheduler.preflight_or_raise = MagicMock()
     scheduler.block_aware_cache = MagicMock()
@@ -706,20 +713,31 @@ async def test_batched_engine_preflight_chat_credits_cached_prefix():
     )
 
     # The probe received the raw token ids, not the count.
-    scheduler.estimate_cached_prefix_tokens.assert_called_once_with(token_ids)
-    assert scheduler.estimate_cached_prefix_tokens.call_args.args[0] is token_ids
+    scheduler.estimate_cached_prefix_for_admission.assert_called_once_with(token_ids)
+    assert (
+        scheduler.estimate_cached_prefix_for_admission.call_args.args[0]
+        is token_ids
+    )
 
-    # Both consumers received cached_tokens=8.
+    # Both consumers received cached_tokens=8 and resident_kv_tokens=8.
     assert scheduler.preflight_eviction_request.call_args.kwargs.get(
         "cached_tokens", 0
     ) == 8
+    assert scheduler.preflight_eviction_request.call_args.kwargs.get(
+        "resident_kv_tokens", 0
+    ) == 8
     assert scheduler.preflight_or_raise.call_args.kwargs.get("cached_tokens", 0) == 8
+    assert scheduler.preflight_or_raise.call_args.kwargs.get(
+        "resident_kv_tokens", 0
+    ) == 8
 
     # The read-only estimate must not touch the allocating fetch_cache path.
     scheduler.block_aware_cache.fetch_cache.assert_not_called()
 
     # Fail-closed: a raising probe must produce cached_tokens=0.
-    scheduler.estimate_cached_prefix_tokens = MagicMock(side_effect=RuntimeError)
+    scheduler.estimate_cached_prefix_for_admission = MagicMock(
+        side_effect=RuntimeError
+    )
     scheduler.preflight_eviction_request = MagicMock(return_value=None)
     scheduler.preflight_or_raise = MagicMock()
 
@@ -730,7 +748,13 @@ async def test_batched_engine_preflight_chat_credits_cached_prefix():
     assert scheduler.preflight_eviction_request.call_args.kwargs.get(
         "cached_tokens", 0
     ) == 0
+    assert scheduler.preflight_eviction_request.call_args.kwargs.get(
+        "resident_kv_tokens", 0
+    ) == 0
     assert scheduler.preflight_or_raise.call_args.kwargs.get("cached_tokens", 0) == 0
+    assert scheduler.preflight_or_raise.call_args.kwargs.get(
+        "resident_kv_tokens", 0
+    ) == 0
 
 
 @pytest.mark.asyncio

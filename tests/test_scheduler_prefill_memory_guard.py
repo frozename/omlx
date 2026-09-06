@@ -1804,3 +1804,370 @@ def test_in_stream_path_ignores_resident_kv_tokens():
     # In-stream path: resident_kv_tokens is ignored, both charge new_tokens.
     assert est_default.kv_exact == est_with_resident.kv_exact
     assert est_default.estimated == est_with_resident.estimated
+
+
+# ---------------------------------------------------------------------------
+# Engine-chain tests (F1: verify resident_kv_tokens reaches admission through
+# the real engine preflight path, not just by calling _admission_estimate).
+# The prior commit shipped inert because no test drove the engine chain.
+# ---------------------------------------------------------------------------
+
+from omlx.cache.paged_cache import PagedCacheManager, compute_block_hash
+
+
+def _make_scheduler_with_cache(block_size: int = 4):
+    """Scheduler with a real PagedCacheManager as block_aware_cache.
+
+    The scheduler from ``_make_scheduler`` has a real memory_monitor but no
+    paged cache (block_size=0).  We attach a real PagedCacheManager so
+    ``estimate_cached_prefix_for_admission`` does a genuine walk and returns
+    non-zero resident_kv_tokens when blocks are inserted.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18
+    scheduler._memory_hard_watermark_bytes = 0
+    manager = PagedCacheManager(
+        block_size=block_size, max_blocks=200,
+        model_name="test-model", initial_blocks=200,
+    )
+    scheduler.block_aware_cache = manager
+    scheduler.config.paged_cache_block_size = block_size
+    # Non-stateful: the stateful clamp is tested separately.
+    scheduler._boundary_snapshot_required = False
+    scheduler._gdn_split_active = MagicMock(return_value=False)
+    scheduler._detect_boundary_snapshot_need = MagicMock(return_value=True)
+    return scheduler, manager
+
+
+def _insert_resident_blocks(manager, token_ids, block_size):
+    """Insert chained blocks covering token_ids into the paged cache hash map."""
+    parent_hash = None
+    num_full = len(token_ids) // block_size
+    for i in range(num_full):
+        start = i * block_size
+        end = start + block_size
+        block_hash = compute_block_hash(
+            parent_hash, token_ids[start:end], model_name="test-model"
+        )
+        block = manager.allocate_block()
+        block.block_hash = block_hash
+        block.token_count = block_size
+        manager.cached_block_hash_to_block.insert(block_hash, block)
+        parent_hash = block_hash
+    return parent_hash
+
+
+def _compute_block_hashes(token_ids, block_size):
+    """Compute the chained block hashes for token_ids without inserting."""
+    parent_hash = None
+    hashes = []
+    num_full = len(token_ids) // block_size
+    for i in range(num_full):
+        start = i * block_size
+        end = start + block_size
+        block_hash = compute_block_hash(
+            parent_hash, token_ids[start:end], model_name="test-model"
+        )
+        hashes.append(block_hash)
+        parent_hash = block_hash
+    return hashes
+
+
+def _make_batched_engine(scheduler, token_ids):
+    """Create a BatchedEngine slice wired to scheduler for preflight_chat.
+
+    Uses ``__new__`` to bypass the full constructor; sets only the attributes
+    that ``preflight_chat`` reads.  The tokenizer returns ``token_ids`` for
+    any prompt, and the chat template is stubbed to a dummy string.
+    """
+    from omlx.engine.batched import BatchedEngine
+
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._loaded = True
+    engine._model_name = "test-model"
+    engine._tokenizer = MagicMock()
+    engine._tokenizer.encode = MagicMock(return_value=list(token_ids))
+    engine._prefill_eviction_callback = None
+    engine._engine = MagicMock()
+    engine._engine.engine.scheduler = scheduler
+    engine._preprocess_messages = MagicMock(side_effect=lambda m: m)
+    engine._apply_chat_template = MagicMock(return_value="dummy")
+    return engine
+
+
+_PATCHES = (
+    patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+    patch("omlx.scheduler.get_phys_footprint", return_value=0),
+)
+
+
+async def test_engine_preflight_chat_forwards_resident_kv_to_admission():
+    """F1 regression: ``BatchedEngine.preflight_chat`` must forward
+    ``resident_kv_tokens`` from the combined probe all the way to
+    ``_admission_estimate``.  The prior commit shipped inert because every
+    engine caller passed only ``cached_tokens`` and let the parameter
+    default to 0.  This test drives the real engine path and asserts the
+    credit arrives non-zero.
+    """
+    block_size = 4
+    scheduler, manager = _make_scheduler_with_cache(block_size)
+    scheduler._memory_hard_limit_bytes = 10**18  # admit everything
+
+    # 20 blocks = 80 tokens, all resident.
+    token_ids = list(range(1, 81))
+    _insert_resident_blocks(manager, token_ids, block_size)
+
+    engine = _make_batched_engine(scheduler, token_ids)
+
+    # Spy on _admission_estimate to capture the kwargs.
+    original = scheduler._admission_estimate
+    captured = {}
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        return original(**kwargs)
+
+    scheduler._admission_estimate = spy
+    try:
+        with _PATCHES[0], _PATCHES[1]:
+            await engine.preflight_chat(
+                [{"role": "user", "content": "hello"}],
+                request_id="req-engine",
+            )
+    finally:
+        scheduler._admission_estimate = original
+
+    assert captured.get("cached_kv_resident") is False, (
+        "engine path must use the route-time path (cached_kv_resident=False)"
+    )
+    assert captured.get("resident_kv_tokens", 0) > 0, (
+        "resident_kv_tokens must arrive non-zero at _admission_estimate "
+        "through the engine chain — this is the F1 regression test"
+    )
+    assert captured.get("resident_kv_tokens") == 80, (
+        f"expected 80 resident tokens, got {captured.get('resident_kv_tokens')}"
+    )
+    assert captured.get("cached_tokens") == 80
+
+
+async def test_engine_preflight_resident_admitted_cold_rejected_under_tight_limit():
+    """Through the engine path (not by calling the scheduler directly):
+    a resident prefix is ADMITTED under a tight limit that rejects the
+    same-size cold prompt.
+    """
+    block_size = 4
+    scheduler, manager = _make_scheduler_with_cache(block_size)
+
+    token_ids = list(range(1, 81))  # 80 tokens, 20 blocks
+    _insert_resident_blocks(manager, token_ids, block_size)
+
+    # Find the tight limit from the estimates.
+    with _PATCHES[0], _PATCHES[1]:
+        resident_est = scheduler._admission_estimate(
+            num_prompt_tokens=80, cached_tokens=80, current=0,
+            cached_kv_resident=False, resident_kv_tokens=80,
+        )
+        cold_est = scheduler._admission_estimate(
+            num_prompt_tokens=80, cached_tokens=0, current=0,
+            cached_kv_resident=False, resident_kv_tokens=0,
+        )
+    assert resident_est is not None and cold_est is not None
+    assert resident_est.kv_exact == 0
+    assert cold_est.kv_exact > 0
+
+    tight_limit = int(resident_est.estimated) + 1
+    assert tight_limit < cold_est.estimated
+    scheduler._memory_hard_limit_bytes = tight_limit
+
+    engine = _make_batched_engine(scheduler, token_ids)
+
+    # Resident: admitted through the engine path.
+    with _PATCHES[0], _PATCHES[1]:
+        await engine.preflight_chat(
+            [{"role": "user", "content": "hello"}],
+            request_id="req-resident-engine",
+        )
+
+    # Cold: same engine, no cache -> rejected.
+    cold_manager = PagedCacheManager(
+        block_size=block_size, max_blocks=200,
+        model_name="test-model", initial_blocks=200,
+    )
+    scheduler.block_aware_cache = cold_manager
+    engine_cold = _make_batched_engine(scheduler, token_ids)
+    with _PATCHES[0], _PATCHES[1], pytest.raises(PrefillMemoryExceededError):
+        await engine_cold.preflight_chat(
+            [{"role": "user", "content": "hello"}],
+            request_id="req-cold-engine",
+        )
+
+
+async def test_engine_preflight_ssd_only_rejected_under_same_limit():
+    """An SSD-only prefix (blocks on SSD but not in memory) is still
+    CHARGED full KV at route time and REJECTED under the same tight limit
+    that admits a resident prefix.  This goes through the engine path.
+    """
+    block_size = 4
+    scheduler, manager = _make_scheduler_with_cache(block_size)
+
+    token_ids = list(range(1, 81))  # 80 tokens, 20 blocks
+
+    # Insert NO blocks in memory.  Instead, mock the SSD manager to report
+    # all blocks as present on SSD.
+    hashes = _compute_block_hashes(token_ids, block_size)
+    hash_set = set(hashes)
+    mock_ssd = MagicMock()
+    mock_ssd.has_block = MagicMock(side_effect=lambda h: h in hash_set)
+    manager._paged_ssd_cache_manager = mock_ssd
+
+    # First, find the tight limit using a resident setup.
+    resident_manager = PagedCacheManager(
+        block_size=block_size, max_blocks=200,
+        model_name="test-model", initial_blocks=200,
+    )
+    _insert_resident_blocks(resident_manager, token_ids, block_size)
+    scheduler.block_aware_cache = resident_manager
+    with _PATCHES[0], _PATCHES[1]:
+        resident_est = scheduler._admission_estimate(
+            num_prompt_tokens=80, cached_tokens=80, current=0,
+            cached_kv_resident=False, resident_kv_tokens=80,
+        )
+    assert resident_est is not None and resident_est.kv_exact == 0
+    tight_limit = int(resident_est.estimated) + 1
+    scheduler._memory_hard_limit_bytes = tight_limit
+
+    # Resident: admitted.
+    engine_resident = _make_batched_engine(scheduler, token_ids)
+    with _PATCHES[0], _PATCHES[1]:
+        await engine_resident.preflight_chat(
+            [{"role": "user", "content": "hello"}],
+            request_id="req-resident-engine",
+        )
+
+    # SSD-only: switch to the SSD-only cache and reject.
+    scheduler.block_aware_cache = manager
+    engine_ssd = _make_batched_engine(scheduler, token_ids)
+    with _PATCHES[0], _PATCHES[1], pytest.raises(PrefillMemoryExceededError):
+        await engine_ssd.preflight_chat(
+            [{"role": "user", "content": "hello"}],
+            request_id="req-ssd-engine",
+        )
+
+
+def test_admission_estimate_raises_on_over_credit():
+    """F4: ``resident_kv_tokens`` exceeding ``cached_tokens`` or
+    ``num_prompt_tokens`` raises ``ValueError`` — misuse is loud, not
+    silently clamped.  This prevents a large value from zeroing
+    ``charge_kv_tokens`` and bypassing the memory guard.
+    """
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+
+    with _PATCHES[0], _PATCHES[1]:
+        # resident_kv_tokens > cached_tokens
+        with pytest.raises(ValueError, match="out of range"):
+            scheduler._admission_estimate(
+                num_prompt_tokens=1000, cached_tokens=500, current=0,
+                cached_kv_resident=False, resident_kv_tokens=900,
+            )
+        # resident_kv_tokens > num_prompt_tokens
+        with pytest.raises(ValueError, match="out of range"):
+            scheduler._admission_estimate(
+                num_prompt_tokens=1000, cached_tokens=2000, current=0,
+                cached_kv_resident=False, resident_kv_tokens=1500,
+            )
+        # negative
+        with pytest.raises(ValueError, match="out of range"):
+            scheduler._admission_estimate(
+                num_prompt_tokens=1000, cached_tokens=500, current=0,
+                cached_kv_resident=False, resident_kv_tokens=-1,
+            )
+
+
+def test_combined_probe_stateful_full_hit_not_underpriced():
+    """F3/M4: the combined probe applies the stateful exact-hit clamp
+    internally.  A stateful full-cache hit returns ``cached_tokens=0``
+    and ``resident_kv_tokens=0``, so ``_admission_estimate`` charges the
+    FULL prefill (KV + transient) — NOT the 1-token floored prefill that
+    an unclamped total would produce.
+    """
+    block_size = 4
+    scheduler, manager = _make_scheduler_with_cache(block_size)
+    # Stateful: the exact-hit clamp triggers.
+    scheduler._boundary_snapshot_required = True
+
+    token_ids = list(range(1, 81))  # 80 tokens = 20 blocks, all resident
+    _insert_resident_blocks(manager, token_ids, block_size)
+
+    estimate = scheduler.estimate_cached_prefix_for_admission(token_ids)
+    # Stateful full hit: clamp reduces cached to 0, resident clamped to 0.
+    assert estimate.cached_tokens == 0, (
+        "stateful full hit must clamp cached_tokens to 0"
+    )
+    assert estimate.resident_kv_tokens == 0, (
+        "resident_kv_tokens must be clamped to cached_tokens=0"
+    )
+
+    # Through _admission_estimate: charges full KV + full transient.
+    with _PATCHES[0], _PATCHES[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=80,
+            cached_tokens=estimate.cached_tokens,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=estimate.resident_kv_tokens,
+        )
+    assert est is not None
+    assert est.kv_exact > 0, (
+        "stateful full hit must charge full KV (not under-priced)"
+    )
+
+    # Compare against the non-stateful full hit (under-priced if unclamped).
+    scheduler._boundary_snapshot_required = False
+    estimate_ns = scheduler.estimate_cached_prefix_for_admission(token_ids)
+    assert estimate_ns.cached_tokens == 80
+    assert estimate_ns.resident_kv_tokens == 80
+    with _PATCHES[0], _PATCHES[1]:
+        est_ns = scheduler._admission_estimate(
+            num_prompt_tokens=80,
+            cached_tokens=estimate_ns.cached_tokens,
+            current=0,
+            cached_kv_resident=False,
+            resident_kv_tokens=estimate_ns.resident_kv_tokens,
+        )
+    assert est_ns is not None
+    assert est_ns.kv_exact == 0, "non-stateful full hit charges 0 KV"
+    assert est.estimated > est_ns.estimated, (
+        "stateful full hit must be MORE expensive than non-stateful "
+        "(not under-priced)"
+    )
+
+
+def test_combined_probe_returns_consistent_pair():
+    """F6: the combined probe returns both values from one walk, so they
+    are always consistent (``0 <= resident_kv_tokens <= cached_tokens``).
+    """
+    block_size = 4
+    scheduler, manager = _make_scheduler_with_cache(block_size)
+
+    # Partial resident hit: 10 blocks resident, 5 SSD-only.
+    token_ids = list(range(1, 81))  # 20 blocks
+    _insert_resident_blocks(manager, token_ids[:40], block_size)  # 10 blocks
+
+    # SSD-only blocks 10..14
+    hashes = _compute_block_hashes(token_ids, block_size)
+    mock_ssd = MagicMock()
+    ssd_hashes = set(hashes[10:15])
+    mock_ssd.has_block = MagicMock(side_effect=lambda h: h in ssd_hashes)
+    manager._paged_ssd_cache_manager = mock_ssd
+
+    estimate = scheduler.estimate_cached_prefix_for_admission(token_ids)
+    assert estimate.cached_tokens == 60, (
+        f"expected 60 cached (40 resident + 20 ssd), got {estimate.cached_tokens}"
+    )
+    assert estimate.resident_kv_tokens == 40, (
+        f"expected 40 resident, got {estimate.resident_kv_tokens}"
+    )
+    assert 0 <= estimate.resident_kv_tokens <= estimate.cached_tokens

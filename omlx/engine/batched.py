@@ -87,6 +87,7 @@ class BatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
         cached_tokens: int = 0,
+        resident_kv_tokens: int = 0,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -100,6 +101,7 @@ class BatchedEngine(BaseEngine):
             ),
             text_only=True,
             cached_tokens=cached_tokens,
+            resident_kv_tokens=resident_kv_tokens,
         )
 
     @property
@@ -1201,10 +1203,13 @@ class BatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
         cached = 0
-        fn = getattr(scheduler, "estimate_cached_prefix_tokens", None)
+        resident_kv = 0
+        fn = getattr(scheduler, "estimate_cached_prefix_for_admission", None)
         if fn is not None:
             try:
-                cached = int(fn(token_ids))
+                estimate = fn(token_ids)
+                cached = int(estimate.cached_tokens)
+                resident_kv = int(estimate.resident_kv_tokens)
             except Exception:
                 logger.debug(
                     "BatchedEngine.preflight_chat: cached-prefix estimate "
@@ -1212,11 +1217,28 @@ class BatchedEngine(BaseEngine):
                     exc_info=True,
                 )
                 cached = 0
+                resident_kv = 0
+        else:
+            # Fall back to the single-value probe if the combined probe is
+            # unavailable (e.g. an older scheduler slice in tests).  The
+            # resident credit is 0 in that case — the pre-cc024dc8 behaviour.
+            fn_legacy = getattr(scheduler, "estimate_cached_prefix_tokens", None)
+            if fn_legacy is not None:
+                try:
+                    cached = int(fn_legacy(token_ids))
+                except Exception:
+                    logger.debug(
+                        "BatchedEngine.preflight_chat: cached-prefix estimate "
+                        "failed; pricing cold",
+                        exc_info=True,
+                    )
+                    cached = 0
         await self._preflight_or_raise_with_eviction(
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
             cached_tokens=cached,
+            resident_kv_tokens=resident_kv,
         )
 
     async def preflight_completion(
@@ -1232,7 +1254,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            token_ids = self._tokenizer.encode(prompt)
+            num_tokens = len(token_ids)
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_completion: tokenizer.encode raised "
@@ -1245,8 +1268,26 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
+        cached = 0
+        resident_kv = 0
+        fn = getattr(scheduler, "estimate_cached_prefix_for_admission", None)
+        if fn is not None:
+            try:
+                estimate = fn(token_ids)
+                cached = int(estimate.cached_tokens)
+                resident_kv = int(estimate.resident_kv_tokens)
+            except Exception:
+                logger.debug(
+                    "BatchedEngine.preflight_completion: cached-prefix "
+                    "estimate failed; pricing cold",
+                    exc_info=True,
+                )
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            cached_tokens=cached,
+            resident_kv_tokens=resident_kv,
         )
 
     async def stream_chat(

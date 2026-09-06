@@ -206,6 +206,22 @@ class _AdmissionEstimate:
     estimated: int
 
 
+class CachedPrefixEstimate(NamedTuple):
+    """Single-walk admission probe result.
+
+    ``cached_tokens`` is the stateful-clamped total reusable prefix count
+    (the same value ``estimate_cached_prefix_tokens`` returns).  ``resident_kv_tokens``
+    is the memory-resident subset, clamped to ``cached_tokens`` so the pair is
+    always consistent: ``0 <= resident_kv_tokens <= cached_tokens``.  Both
+    values come from one ``peek_cached_prefix_split`` walk, so they observe
+    the same cache snapshot — two separate probes could see different states
+    (LRU insert/evict between calls) and produce an inconsistent pair.
+    """
+
+    cached_tokens: int
+    resident_kv_tokens: int
+
+
 @dataclass
 class _VLMMTPDecodeState:
     """Per-request state for vlm_mtp decode that bypasses BatchGenerator.
@@ -8666,6 +8682,84 @@ class Scheduler:
             )
             return 0
 
+    def estimate_cached_prefix_for_admission(
+        self, token_ids: list[int]
+    ) -> CachedPrefixEstimate:
+        """Single-walk admission probe returning both credit values.
+
+        This is the engine-facing API for route-time admission.  It performs
+        ONE ``peek_cached_prefix_split`` walk, applies the stateful exact-hit
+        clamp to the total internally, and returns a ``CachedPrefixEstimate``
+        whose ``cached_tokens`` and ``resident_kv_tokens`` are guaranteed
+        consistent (``0 <= resident_kv_tokens <= cached_tokens``) because
+        they come from the same snapshot.
+
+        Using this method instead of calling ``estimate_cached_prefix_tokens``
+        and ``estimate_cached_prefix_split`` separately fixes two footguns:
+
+        - **Clamp asymmetry (F3):** ``estimate_cached_prefix_split`` returns
+          RAW (unclamped) values while ``estimate_cached_prefix_tokens``
+          applies the stateful clamp.  A caller that uses
+          ``resident + ssd_only`` as ``cached_tokens`` bypasses the clamp
+          and under-prices stateful full-cache hits (1-token floored
+          prefill instead of the full prefill transient).  This method
+          applies the clamp to ``cached_tokens`` and then clamps
+          ``resident_kv_tokens`` to the clamped total, so a stateful
+          full hit charges the full prefill (not under-priced).
+        - **Inconsistent snapshots (F6):** two separate probes each perform
+          a full locked walk and can observe different cache states (LRU
+          insert/evict between calls), producing a
+          ``(cached_tokens, resident_kv_tokens)`` pair that
+          ``_admission_estimate`` silently mixes.  One walk = one snapshot.
+
+        ``_boundary_snapshot_required`` is never resolved lazily here, for
+        the same reason as ``estimate_cached_prefix_tokens``:
+        ``_detect_boundary_snapshot_need`` runs ``model.make_cache()`` and
+        mutates the model, which a route-time estimate must not do.
+
+        Args:
+            token_ids: Prompt token ids being admitted
+
+        Returns:
+            ``CachedPrefixEstimate(cached_tokens, resident_kv_tokens)``,
+            or ``(0, 0)`` when there is no prefix cache or the lookup raises.
+        """
+        if self.block_aware_cache is None:
+            return CachedPrefixEstimate(0, 0)
+
+        try:
+            resident, ssd_only = (
+                self.block_aware_cache.peek_cached_prefix_split(token_ids)
+            )
+            cached = resident + ssd_only
+            stateful = self._boundary_snapshot_required is not False
+
+            if cached >= len(token_ids) and stateful:
+                if self._gdn_split_active():
+                    block = int(self.config.paged_cache_block_size or 0)
+                    cached = max(0, cached - block)
+                else:
+                    cached = 0
+
+            # resident_kv_tokens is clamped to the (possibly stateful-clamped)
+            # cached total.  For a stateful full hit (cached -> 0) this makes
+            # resident 0 too, so _admission_estimate charges the full prefill
+            # KV + transient — NOT under-priced.  For a partial hit the clamp
+            # is a no-op (resident <= cached by construction from the walk).
+            resident = min(resident, cached)
+
+            return CachedPrefixEstimate(
+                cached_tokens=cached,
+                resident_kv_tokens=resident,
+            )
+        except Exception:
+            logger.debug(
+                "Cached-prefix admission estimate failed for %d prompt tokens",
+                len(token_ids or []),
+                exc_info=True,
+            )
+            return CachedPrefixEstimate(0, 0)
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
@@ -10274,36 +10368,66 @@ class Scheduler:
         monitor = self.memory_monitor
         if monitor is None:
             return None
+        # --- F4: validate resident_kv_tokens (same fail-open class as bc5f09e3)
+        # An unbounded resident_kv_tokens zeroes charge_kv_tokens, silently
+        # bypassing the memory guard.  Raise ValueError on out-of-range input
+        # so misuse is LOUD rather than silently corrected: the combined probe
+        # (estimate_cached_prefix_for_admission) guarantees
+        # 0 <= resident_kv_tokens <= cached_tokens by construction, so a
+        # violation here is always a caller bug, not a legitimate edge case.
+        # Chose raise-over-clamp because this is a memory-guard seam — silent
+        # clamping hid the dead-code bug (F1) for an entire review cycle; a
+        # ValueError makes the next regression visible in the first test run.
+        _rkv = int(resident_kv_tokens)
+        _ct = max(0, int(cached_tokens))
+        _npt = max(0, int(num_prompt_tokens))
+        if _rkv < 0 or _rkv > _ct or _rkv > _npt:
+            raise ValueError(
+                f"resident_kv_tokens={_rkv} out of range "
+                f"[0, min(cached_tokens={_ct}, num_prompt_tokens={_npt}))]"
+            )
         # --- credit-driven fail-open seam --------------------------------
         # A credit (cached_tokens / resident_kv_tokens) must NEVER cause
         # this guard to skip itself. Returning None here is reserved for
         # the genuinely uninformative case (no monitor above, or no model
         # info / zero estimate below) — a credit is a *claim* about the
         # prompt, not missing data, and the route-time peek that supplies
-        # it (estimate_cached_prefix_tokens / estimate_cached_prefix_split,
-        # :8568) can OVER-REPORT: it peeks with no extra_keys, so a prompt
-        # whose text matches a cached entry but whose images differ is
-        # reported as a hit, and LRU can drop the prefix between the peek
-        # and schedule. When the credit over-reports to >= the prompt
-        # length, new_tokens computes to 0 (or 1, which makes
-        # prefill_tokens 0) and the old early returns skipped the guard
-        # entirely — admitting the FULL prefill unchecked. Floor
-        # new_tokens to 1 so an exact/near-exact hit still prices its
-        # residency and is CHECKED, not admitted by skipping.
+        # it (estimate_cached_prefix_for_admission, :8700) can OVER-REPORT:
+        # it peeks with no extra_keys, so a prompt whose text matches a
+        # cached entry but whose images differ is reported as a hit, and
+        # LRU can drop the prefix between the peek and schedule. When the
+        # credit over-reports to >= the prompt length, new_tokens computes
+        # to 0 (or 1, which makes prefill_tokens 0) and the old early
+        # returns skipped the guard entirely — admitting the FULL prefill
+        # unchecked. Floor new_tokens to 1 so an exact/near-exact hit
+        # still prices its residency and is CHECKED, not admitted by
+        # skipping.
         #
         # Route-time path (cached_kv_resident=False): charges
         # max(num_prompt_tokens - resident_kv_tokens, 0) for KV — resident
         # blocks are already in ``current``, so only SSD-only and uncached
-        # tokens need allocation.  A true full-cache hit with all blocks
-        # resident charges ~0 KV but still prices the transient for a
-        # 1-token floored prefill, which passes under normal memory but
-        # is rejected when memory is genuinely exhausted — admitted by
-        # passing, not by skipping.
+        # tokens need allocation.  Two full-cache-hit sub-cases:
+        #
+        #   * NON-STATEFUL full hit (sliceable cache): the combined probe
+        #     returns cached_tokens = N, resident_kv_tokens = N, so
+        #     new_tokens = 0 (floored to 1) and charge_kv_tokens = 0.
+        #     The estimate is ~0 KV + 1-token floored transient — admitted
+        #     by passing, not by skipping, and rejected only when memory is
+        #     genuinely exhausted.
+        #
+        #   * STATEFUL full hit (non-sliceable / unresolved cache): the
+        #     combined probe applies the stateful clamp, returning
+        #     cached_tokens = 0 and resident_kv_tokens = 0.  new_tokens =
+        #     num_prompt_tokens (full prefill) and charge_kv_tokens =
+        #     num_prompt_tokens (full KV).  The estimate is the full
+        #     prefill KV + transient — NOT under-priced, because the
+        #     stateful cache cannot start generation at N and must
+        #     re-prefill the whole prompt.
         #
         # In-stream path (cached_kv_resident=True): charges new_tokens
         # because _prepare_prefix_cache_for_request has already loaded the
         # cached prefix into the request's block table.  resident_kv_tokens
-        # is ignored.
+        # is ignored (validated above only to catch caller bugs).
         new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
         if new_tokens < 1:
             new_tokens = 1

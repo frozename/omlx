@@ -1125,14 +1125,34 @@ class PagedCacheManager(CacheManager):
         if not self.enable_caching or not token_ids:
             return 0, 0
 
+        num_full_blocks = len(token_ids) // self.block_size
+
+        # --- F2: shrink the lock-held walk --------------------------------
+        # The hash chain is deterministic (each block_hash depends only on
+        # parent_hash + block_tokens + extra_keys + model_name, none of which
+        # mutate under the lock), so we can compute every hash and snapshot
+        # in-memory membership under ``self._lock``, RELEASE it, and then do
+        # the SSD ``has_block()`` calls outside.  ``has_block`` acquires the
+        # SSD manager's ``_hot_cache_lock`` and ``_pending_write_hashes_lock``
+        # internally; holding ``self._lock`` across those calls created an
+        # undocumented lock ordering that a future SSD-side callback into the
+        # paged cache would deadlock.  By releasing ``self._lock`` first we
+        # break that potential cycle.
+        #
+        # SEAM CONTRACT: ``ssd_manager.has_block`` must NOT call back into
+        # this ``PagedCacheManager`` (must not acquire ``self._lock``); its
+        # own internal locks are fine because we no longer hold ``self._lock``
+        # when it runs.  It must remain O(1) per call so the outside-lock
+        # loop does not serialise HTTP admissions on a long walk.
         with self._lock:
             parent_hash = None
-            resident_tokens = 0
-            ssd_only_tokens = 0
             ssd_manager = self._paged_ssd_cache_manager
-
-            num_full_blocks = len(token_ids) // self.block_size
-
+            # Pre-compute the hash chain and snapshot in-memory membership
+            # for every full block.  The chain is sequential but purely a
+            # function of the token_ids, so this is safe under the lock and
+            # bounded by num_full_blocks (the same bound the old walk had).
+            block_hashes: list[BlockHash] = []
+            in_memory_flags: list[bool] = []
             for i in range(num_full_blocks):
                 start = i * self.block_size
                 end = start + self.block_size
@@ -1143,25 +1163,35 @@ class PagedCacheManager(CacheManager):
                     extra_key_token_start=extra_key_token_start,
                     extra_key_ranges=extra_key_ranges,
                 )
-
                 block_hash = compute_block_hash(
                     parent_hash, block_tokens,
                     extra_keys=block_extra_keys, model_name=self.model_name,
                 )
-
-                in_memory = (
-                    self.cached_block_hash_to_block.get_block(block_hash) is not None
+                block_hashes.append(block_hash)
+                in_memory_flags.append(
+                    self.cached_block_hash_to_block.get_block(block_hash)
+                    is not None
                 )
-                if in_memory:
-                    resident_tokens += self.block_size
-                elif ssd_manager is not None and ssd_manager.has_block(block_hash):
-                    ssd_only_tokens += self.block_size
-                else:
-                    break
-
                 parent_hash = block_hash
 
-            return resident_tokens, ssd_only_tokens
+        # SSD tier checks outside ``self._lock``.  The walk still stops at
+        # the first block present in neither tier, preserving the existing
+        # prefix-contiguity semantics.  For any given cache state the
+        # returned counts are unchanged: in-memory membership was snapshotted
+        # under the lock, and ``has_block`` does its own internal locking.
+        resident_tokens = 0
+        ssd_only_tokens = 0
+        for i in range(num_full_blocks):
+            if in_memory_flags[i]:
+                resident_tokens += self.block_size
+            elif ssd_manager is not None and ssd_manager.has_block(
+                block_hashes[i]
+            ):
+                ssd_only_tokens += self.block_size
+            else:
+                break
+
+        return resident_tokens, ssd_only_tokens
 
     def peek_cached_prefix_tokens(
         self,
